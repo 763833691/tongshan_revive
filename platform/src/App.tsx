@@ -9,6 +9,7 @@ import { DEFAULT_BASE_LAYER, Z_OFFSET_DEFAULT, type BaseLayerKind } from "@/conf
 import type { UnitFeature } from "@/lib/units"
 import { TopBar } from "@/components/TopBar"
 import { UnitPanel } from "@/components/UnitPanel"
+import { EditorPanel } from "@/components/EditorPanel"
 import { DisplaySettings, HelpOverlay, LegendCard, MeasureBar, StatusBar } from "@/components/Overlays"
 import { BookmarkPanel } from "@/components/Bookmarks"
 
@@ -29,6 +30,8 @@ export default function App() {
   const [progress, setProgress] = useState({ pending: 0, processing: 0 })
   const [measureMode, setMeasureMode] = useState<MeasureMode>("none")
   const [measure, setMeasure] = useState<MeasureState>(EMPTY_MEASURE)
+  const [editMode, setEditMode] = useState(false)
+  const [drawing, setDrawing] = useState(false)
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -38,6 +41,11 @@ export default function App() {
       onTileProgress: (pending, processing) => setProgress({ pending, processing }),
       onSelectChange: setSelected,
       onMeasureChange: setMeasure,
+      onUnitsChanged: setUnits,
+      onEditState: (s) => {
+        setEditMode(s.editMode)
+        setDrawing(s.drawing)
+      },
     })
     controllerRef.current = controller
     void controller.init()
@@ -70,6 +78,15 @@ export default function App() {
         onHome={() => {
           controllerRef.current?.selectUnit(null)
           controllerRef.current?.flyCity()
+        }}
+        editMode={editMode}
+        onEditMode={(on) => {
+          setEditMode(on)
+          if (on) {
+            setMeasureMode("none")
+            controllerRef.current?.setMeasureMode("none")
+          }
+          controllerRef.current?.setEditMode(on)
         }}
         selected={selected}
         onClear={() => controllerRef.current?.selectUnit(null)}
@@ -118,6 +135,42 @@ export default function App() {
             onCapture={() => controllerRef.current!.getCameraView()}
             onRestore={(v) => controllerRef.current?.flyToView(v)}
           />
+          {editMode && (
+            <EditorPanel
+              selected={selected}
+              drawing={drawing}
+              onExit={() => {
+                setEditMode(false)
+                controllerRef.current?.setEditMode(false)
+              }}
+              onSave={() => controllerRef.current?.saveEdits()}
+              onRevert={() => void controllerRef.current?.revertEdits()}
+              onReset={() => {
+                if (window.confirm("恢复为原始 25 个单元边界？本机保存的修改将被清除。")) {
+                  void controllerRef.current?.resetUnits()
+                }
+              }}
+              onDelete={() => {
+                if (window.confirm(`删除单元 ${selected !== null ? String(selected).padStart(2, "0") : ""}？`)) {
+                  controllerRef.current?.deleteSelectedUnit()
+                }
+              }}
+              onStartDrawing={() => controllerRef.current?.startDrawing()}
+              onFinishDrawing={() => controllerRef.current?.finishDrawing()}
+              onCancelDrawing={() => controllerRef.current?.cancelDrawing()}
+              onExport={() => {
+                const json = controllerRef.current?.exportUnitsJson()
+                if (!json) return
+                const blob = new Blob([json], { type: "application/geo+json" })
+                const url = URL.createObjectURL(blob)
+                const a = document.createElement("a")
+                a.href = url
+                a.download = "units.geojson"
+                a.click()
+                URL.revokeObjectURL(url)
+              }}
+            />
+          )}
           <HelpOverlay status={tilesetStatus} onRetry={() => controllerRef.current?.reloadTileset()} />
         </main>
       </div>

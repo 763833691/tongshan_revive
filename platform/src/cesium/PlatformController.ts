@@ -20,7 +20,17 @@ import {
   Z_OFFSET_DEFAULT,
   type BaseLayerKind,
 } from "@/config"
-import { loadUnits, pointInRing, type UnitFeature } from "@/lib/units"
+import {
+  clearStoredUnits,
+  computeUnitMetrics,
+  loadStoredUnits,
+  loadUnits,
+  normalizeRing,
+  pointInRing,
+  storeUnits,
+  unitsToGeoJson,
+  type UnitFeature,
+} from "@/lib/units"
 
 export type TilesetStatus = "loading" | "ready" | "missing" | "error"
 export type MeasureMode = "none" | "distance" | "area"
@@ -42,12 +52,20 @@ export interface CameraView {
   roll: number
 }
 
+export interface EditState {
+  editMode: boolean
+  drawing: boolean
+  selected: number | null
+}
+
 export interface ControllerCallbacks {
   onUnitsLoaded: (units: UnitFeature[]) => void
   onTilesetStatus: (status: TilesetStatus) => void
   onTileProgress: (pending: number, processing: number) => void
   onSelectChange: (unit: number | null) => void
   onMeasureChange: (state: MeasureState) => void
+  onUnitsChanged: (units: UnitFeature[]) => void
+  onEditState: (state: EditState) => void
 }
 
 const EARTH_RADIUS = 6371008.8
@@ -64,6 +82,15 @@ export class PlatformController {
   private clipEnabled = false
   private extruded = false
   private wash: Cesium.Entity | null = null
+  private editMode = false
+  private drawing = false
+  private drawPoints: [number, number][] = []
+  private vertexEntities: Cesium.Entity[] = []
+  private midEntities: Cesium.Entity[] = []
+  private dragIndex: number | null = null
+  private drawPolyline: Cesium.Entity | null = null
+  private drawPolygon: Cesium.Entity | null = null
+  private drawPointEntities: Cesium.Entity[] = []
   private zOffset = Z_OFFSET_DEFAULT
   private opacity = 1
   private baseKind: BaseLayerKind = "satellite"
@@ -113,87 +140,170 @@ export class PlatformController {
     }
 
     this.handler = new Cesium.ScreenSpaceEventHandler(this.viewer.scene.canvas)
-    this.handler.setInputAction((e: Cesium.ScreenSpaceEventHandler.PositionedEvent) => {
-      if (this.measureMode !== "none" && !this.measureFinished) {
-        this.addMeasurePoint(e.position)
-        return
-      }
-      this.selectUnit(this.pickUnitAt(e.position))
-    }, Cesium.ScreenSpaceEventType.LEFT_CLICK)
-    this.handler.setInputAction((e: Cesium.ScreenSpaceEventHandler.MotionEvent) => {
-      const canvas = this.viewer.scene.canvas
-      if (this.measureMode !== "none" && !this.measureFinished) {
-        canvas.style.cursor = "crosshair"
-        return
-      }
-      const picked = this.viewer.scene.pick(e.endPosition)
-      canvas.style.cursor = picked?.id instanceof Cesium.Entity ? "pointer" : "default"
-    }, Cesium.ScreenSpaceEventType.MOUSE_MOVE)
+    this.handler.setInputAction(
+      (e: Cesium.ScreenSpaceEventHandler.PositionedEvent) => this.onLeftClick(e.position),
+      Cesium.ScreenSpaceEventType.LEFT_CLICK,
+    )
+    this.handler.setInputAction(
+      (e: Cesium.ScreenSpaceEventHandler.MotionEvent) => this.onMouseMove(e.endPosition),
+      Cesium.ScreenSpaceEventType.MOUSE_MOVE,
+    )
+    this.handler.setInputAction(
+      (e: Cesium.ScreenSpaceEventHandler.PositionedEvent) => this.onLeftDown(e.position),
+      Cesium.ScreenSpaceEventType.LEFT_DOWN,
+    )
+    this.handler.setInputAction(() => this.onLeftUp(), Cesium.ScreenSpaceEventType.LEFT_UP)
+    this.handler.setInputAction(
+      (e: Cesium.ScreenSpaceEventHandler.PositionedEvent) => this.onRightClick(e.position),
+      Cesium.ScreenSpaceEventType.RIGHT_CLICK,
+    )
+    this.handler.setInputAction(() => {
+      if (this.drawing) this.finishDrawing()
+    }, Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK)
     this.viewer.scene.preRender.addEventListener(this.clampCameraPitch)
     this.viewer.scene.preRender.addEventListener(this.updateGlobeVisibility)
     window.addEventListener("keydown", this.onKeyDown)
   }
 
   private onKeyDown = (e: KeyboardEvent) => {
-    if (e.key === "Escape" && this.selected !== null) this.selectUnit(null)
+    if (e.key !== "Escape") return
+    if (this.drawing) {
+      this.cancelDrawing()
+      return
+    }
+    if (this.editMode) {
+      this.setEditMode(false)
+      return
+    }
+    if (this.selected !== null) this.selectUnit(null)
+  }
+
+  private onLeftClick(screen: Cesium.Cartesian2) {
+    if (this.drawing) {
+      this.addDrawPoint(screen)
+      return
+    }
+    if (this.measureMode !== "none" && !this.measureFinished) {
+      this.addMeasurePoint(screen)
+      return
+    }
+    this.selectUnit(this.pickUnitAt(screen))
+  }
+
+  private onMouseMove(screen: Cesium.Cartesian2) {
+    const canvas = this.viewer.scene.canvas
+    if (this.dragIndex !== null) {
+      this.updateDrag(screen)
+      canvas.style.cursor = "grabbing"
+      return
+    }
+    if (this.drawing) {
+      this.updateDrawPreview(screen)
+      canvas.style.cursor = "crosshair"
+      return
+    }
+    if (this.measureMode !== "none" && !this.measureFinished) {
+      canvas.style.cursor = "crosshair"
+      return
+    }
+    const picked = this.viewer.scene.pick(screen)
+    canvas.style.cursor = picked?.id instanceof Cesium.Entity ? "pointer" : "default"
+  }
+
+  private onLeftDown(screen: Cesium.Cartesian2) {
+    if (!this.editMode || this.drawing) return
+    const picked = this.viewer.scene.pick(screen)
+    const id = picked?.id
+    if (!(id instanceof Cesium.Entity)) return
+    const props = id.properties as Cesium.PropertyBag | undefined
+    const vertex = props?.editVertex?.getValue()
+    if (typeof vertex === "number") {
+      this.dragIndex = vertex
+      this.viewer.scene.screenSpaceCameraController.enableRotate = false
+      return
+    }
+    const mid = props?.editMid?.getValue()
+    if (typeof mid === "number") this.insertVertex(mid)
+  }
+
+  private onLeftUp() {
+    if (this.dragIndex === null) return
+    this.dragIndex = null
+    this.viewer.scene.screenSpaceCameraController.enableRotate = true
+    this.commitCurrentUnit()
+  }
+
+  private onRightClick(screen: Cesium.Cartesian2) {
+    if (this.drawing) {
+      this.finishDrawing()
+      return
+    }
+    if (!this.editMode) return
+    const picked = this.viewer.scene.pick(screen)
+    const id = picked?.id
+    if (!(id instanceof Cesium.Entity)) return
+    const vertex = (id.properties as Cesium.PropertyBag | undefined)?.editVertex?.getValue()
+    if (typeof vertex === "number") this.deleteVertex(vertex)
   }
 
   async init() {
     this.flyCity(0)
     try {
-      this.units = await loadUnits(UNITS_URL)
+      this.units = loadStoredUnits() ?? (await loadUnits(UNITS_URL))
     } catch (err) {
       console.error("单元数据加载失败", err)
       this.cb.onTilesetStatus("error")
       return
     }
     if (this.destroyed) return
-    this.cb.onUnitsLoaded(this.units)
+    this.cb.onUnitsLoaded(this.snapshotUnits())
     this.addUnitEntities()
     await this.tryLoadTileset()
   }
 
   private addUnitEntities() {
-    for (const u of this.units) {
-      const color = Cesium.Color.fromCssColorString(GRADE_COLOR[u.grade])
-      const positions = u.ring.map(([lon, lat]) => Cesium.Cartesian3.fromDegrees(lon, lat))
-      const fill = this.viewer.entities.add({
-        id: `unit-fill-${u.unit}`,
-        properties: { unit: u.unit },
-        polygon: {
-          hierarchy: new Cesium.PolygonHierarchy(positions),
-          material: color.withAlpha(0.26),
-          outline: false,
-        },
-      })
-      const outline = this.viewer.entities.add({
-        id: `unit-outline-${u.unit}`,
-        properties: { unit: u.unit },
-        polyline: {
-          positions,
-          width: new Cesium.ConstantProperty(1.6),
-          material: color.withAlpha(0.95),
-          clampToGround: true,
-        },
-      })
-      const label = this.viewer.entities.add({
-        id: `unit-label-${u.unit}`,
-        properties: { unit: u.unit },
-        position: Cesium.Cartesian3.fromDegrees(u.centroid[0], u.centroid[1]),
-        label: {
-          text: String(u.unit).padStart(2, "0"),
-          font: "700 13px 'Microsoft YaHei', sans-serif",
-          fillColor: Cesium.Color.fromCssColorString("#f0ead8"),
-          style: Cesium.LabelStyle.FILL,
-          pixelOffset: new Cesium.Cartesian2(0, -2),
-          scaleByDistance: new Cesium.NearFarScalar(200, 1.15, 8000, 0.85),
-          disableDepthTestDistance: Number.POSITIVE_INFINITY,
-        },
-      })
-      this.fills.set(u.unit, fill)
-      this.outlines.set(u.unit, outline)
-      this.labels.set(u.unit, label)
-    }
+    for (const u of this.units) this.createUnitEntities(u)
+  }
+
+  private createUnitEntities(u: UnitFeature) {
+    const color = Cesium.Color.fromCssColorString(GRADE_COLOR[u.grade])
+    const positions = u.ring.map(([lon, lat]) => Cesium.Cartesian3.fromDegrees(lon, lat))
+    const fill = this.viewer.entities.add({
+      id: `unit-fill-${u.unit}`,
+      properties: { unit: u.unit },
+      polygon: {
+        hierarchy: new Cesium.PolygonHierarchy(positions),
+        material: color.withAlpha(0.26),
+        outline: false,
+      },
+    })
+    const outline = this.viewer.entities.add({
+      id: `unit-outline-${u.unit}`,
+      properties: { unit: u.unit },
+      polyline: {
+        positions,
+        width: new Cesium.ConstantProperty(1.6),
+        material: color.withAlpha(0.95),
+        clampToGround: true,
+      },
+    })
+    const label = this.viewer.entities.add({
+      id: `unit-label-${u.unit}`,
+      properties: { unit: u.unit },
+      position: Cesium.Cartesian3.fromDegrees(u.centroid[0], u.centroid[1]),
+      label: {
+        text: String(u.unit).padStart(2, "0"),
+        font: "700 13px 'Microsoft YaHei', sans-serif",
+        fillColor: Cesium.Color.fromCssColorString("#f0ead8"),
+        style: Cesium.LabelStyle.FILL,
+        pixelOffset: new Cesium.Cartesian2(0, -2),
+        scaleByDistance: new Cesium.NearFarScalar(200, 1.15, 8000, 0.85),
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+    })
+    this.fills.set(u.unit, fill)
+    this.outlines.set(u.unit, outline)
+    this.labels.set(u.unit, label)
   }
 
   private async tryLoadTileset() {
@@ -293,7 +403,7 @@ export class PlatformController {
       this.viewer.entities.remove(this.wash)
       this.wash = null
     }
-    if (this.selected === null || this.clipEnabled) return
+    if (this.editMode || this.selected === null || this.clipEnabled) return
     const u = this.units.find((x) => x.unit === this.selected)
     if (!u) return
     const d = 0.15
@@ -340,6 +450,344 @@ export class PlatformController {
     return hit ? hit.unit : null
   }
 
+  /* ---------------- 边界编辑 ---------------- */
+
+  private pickGroundPosition(screen: Cesium.Cartesian2): Cesium.Cartesian3 | null {
+    const scene = this.viewer.scene
+    let cartesian: Cesium.Cartesian3 | undefined
+    try {
+      cartesian = scene.pickPosition(screen)
+    } catch {
+      cartesian = undefined
+    }
+    if (!Cesium.defined(cartesian)) {
+      cartesian = this.viewer.camera.pickEllipsoid(screen, Cesium.Ellipsoid.WGS84)
+    }
+    return cartesian ?? null
+  }
+
+  private snapshotUnits(): UnitFeature[] {
+    return this.units.map((u) => ({
+      ...u,
+      ring: u.ring.map(([lon, lat]) => [lon, lat] as [number, number]),
+      centroid: [u.centroid[0], u.centroid[1]] as [number, number],
+      bbox: { ...u.bbox },
+    }))
+  }
+
+  private editState(): EditState {
+    return { editMode: this.editMode, drawing: this.drawing, selected: this.selected }
+  }
+
+  private refreshUnitGeometry(u: UnitFeature) {
+    const positions = this.ringPositions(u)
+    const f = this.fills.get(u.unit)
+    if (f?.polygon) {
+      f.polygon.hierarchy = new Cesium.ConstantProperty(new Cesium.PolygonHierarchy(positions))
+    }
+    const o = this.outlines.get(u.unit)
+    if (o?.polyline) {
+      o.polyline.positions = new Cesium.ConstantProperty(positions)
+    }
+    const l = this.labels.get(u.unit)
+    if (l) l.position = new Cesium.ConstantPositionProperty(Cesium.Cartesian3.fromDegrees(u.centroid[0], u.centroid[1]))
+  }
+
+  private clearVertices() {
+    for (const e of [...this.vertexEntities, ...this.midEntities]) this.viewer.entities.remove(e)
+    this.vertexEntities = []
+    this.midEntities = []
+  }
+
+  /** 顶点贴到模型/地表实际高度，避免悬空 */
+  private surfacePosition(lon: number, lat: number): Cesium.Cartesian3 {
+    const carto = Cesium.Cartographic.fromDegrees(lon, lat)
+    try {
+      const h = this.viewer.scene.sampleHeight(carto)
+      if (h !== undefined && Number.isFinite(h)) {
+        return Cesium.Cartesian3.fromRadians(carto.longitude, carto.latitude, h + 0.25)
+      }
+    } catch {
+      // 模型该处尚未渲染时回退到高程偏移
+    }
+    return Cesium.Cartesian3.fromDegrees(lon, lat, this.zOffset + 0.5)
+  }
+
+  private rebuildVertices() {
+    this.clearVertices()
+    if (!this.editMode || this.drawing || this.selected === null) return
+    const u = this.units.find((x) => x.unit === this.selected)
+    if (!u) return
+    const pts = u.ring.slice(0, -1)
+    pts.forEach(([lon, lat], index) => {
+      this.vertexEntities.push(
+        this.viewer.entities.add({
+          position: this.surfacePosition(lon, lat),
+          properties: { editVertex: index, editUnit: u.unit },
+          point: {
+            pixelSize: 11,
+            color: Cesium.Color.WHITE,
+            outlineColor: Cesium.Color.fromCssColorString(SELECT_COLOR),
+            outlineWidth: 2,
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          },
+        }),
+      )
+    })
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i]
+      const b = pts[(i + 1) % pts.length]
+      this.midEntities.push(
+        this.viewer.entities.add({
+          position: this.surfacePosition((a[0] + b[0]) / 2, (a[1] + b[1]) / 2),
+          properties: { editMid: i, editUnit: u.unit },
+          point: {
+            pixelSize: 7,
+            color: Cesium.Color.fromCssColorString("#ffd166").withAlpha(0.9),
+            disableDepthTestDistance: Number.POSITIVE_INFINITY,
+          },
+        }),
+      )
+    }
+  }
+
+  private updateDrag(screen: Cesium.Cartesian2) {
+    if (this.dragIndex === null || this.selected === null) return
+    const cart = this.pickGroundPosition(screen)
+    if (!cart) return
+    const u = this.units.find((x) => x.unit === this.selected)
+    if (!u) return
+    const carto = Cesium.Cartographic.fromCartesian(cart)
+    const lon = Cesium.Math.toDegrees(carto.longitude)
+    const lat = Cesium.Math.toDegrees(carto.latitude)
+    u.ring[this.dragIndex] = [lon, lat]
+    if (this.dragIndex === 0) u.ring[u.ring.length - 1] = [lon, lat]
+    this.refreshUnitGeometry(u)
+    const v = this.vertexEntities[this.dragIndex]
+    if (v) v.position = new Cesium.ConstantPositionProperty(this.surfacePosition(lon, lat))
+  }
+
+  private insertVertex(midIndex: number) {
+    if (this.selected === null) return
+    const u = this.units.find((x) => x.unit === this.selected)
+    if (!u) return
+    const pts = u.ring.slice(0, -1)
+    const a = pts[midIndex]
+    const b = pts[(midIndex + 1) % pts.length]
+    pts.splice(midIndex + 1, 0, [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2])
+    u.ring = normalizeRing(pts)
+    Object.assign(u, computeUnitMetrics(u.ring))
+    this.refreshUnitGeometry(u)
+    this.rebuildVertices()
+    this.cb.onUnitsChanged(this.snapshotUnits())
+  }
+
+  private deleteVertex(index: number) {
+    if (this.selected === null) return
+    const u = this.units.find((x) => x.unit === this.selected)
+    if (!u) return
+    const pts = u.ring.slice(0, -1)
+    if (pts.length <= 3) return
+    pts.splice(index, 1)
+    u.ring = normalizeRing(pts)
+    Object.assign(u, computeUnitMetrics(u.ring))
+    this.refreshUnitGeometry(u)
+    this.rebuildVertices()
+    this.cb.onUnitsChanged(this.snapshotUnits())
+  }
+
+  private commitCurrentUnit() {
+    if (this.selected === null) return
+    const u = this.units.find((x) => x.unit === this.selected)
+    if (!u) return
+    u.ring = normalizeRing(u.ring)
+    Object.assign(u, computeUnitMetrics(u.ring))
+    this.refreshUnitGeometry(u)
+    if (this.clipEnabled) this.applyClip()
+    this.rebuildVertices()
+    this.applyUnitStyles()
+    this.cb.onUnitsChanged(this.snapshotUnits())
+  }
+
+  setEditMode(on: boolean) {
+    if (this.editMode === on) return
+    this.editMode = on
+    if (!on) {
+      this.cancelDrawing()
+      this.dragIndex = null
+      this.viewer.scene.screenSpaceCameraController.enableRotate = true
+    }
+    this.clearVertices()
+    this.rebuildVertices()
+    this.applyUnitStyles()
+    this.updateWash()
+    this.cb.onEditState(this.editState())
+  }
+
+  startDrawing() {
+    if (!this.editMode) this.setEditMode(true)
+    this.drawing = true
+    this.drawPoints = []
+    this.clearDrawEntities()
+    this.updateWash()
+    this.cb.onEditState(this.editState())
+  }
+
+  private addDrawPoint(screen: Cesium.Cartesian2) {
+    const cart = this.pickGroundPosition(screen)
+    if (!cart) return
+    const carto = Cesium.Cartographic.fromCartesian(cart)
+    this.drawPoints.push([Cesium.Math.toDegrees(carto.longitude), Cesium.Math.toDegrees(carto.latitude)])
+    this.drawPointEntities.push(
+      this.viewer.entities.add({
+        position: Cesium.Cartesian3.fromDegrees(this.drawPoints[this.drawPoints.length - 1][0], this.drawPoints[this.drawPoints.length - 1][1], this.zOffset + 0.8),
+        point: {
+          pixelSize: 9,
+          color: Cesium.Color.fromCssColorString(SELECT_COLOR),
+          disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        },
+      }),
+    )
+    this.updateDrawPreview()
+  }
+
+  private updateDrawPreview(screen?: Cesium.Cartesian2) {
+    const cursor = screen ? this.pickGroundPosition(screen) : null
+    const cursorPt = cursor ? Cesium.Cartographic.fromCartesian(cursor) : null
+    const pts = [...this.drawPoints]
+    if (cursorPt) pts.push([Cesium.Math.toDegrees(cursorPt.longitude), Cesium.Math.toDegrees(cursorPt.latitude)])
+    if (pts.length < 2) return
+    const positions = pts.map(([lon, lat]) => Cesium.Cartesian3.fromDegrees(lon, lat))
+    if (!this.drawPolyline) {
+      this.drawPolyline = this.viewer.entities.add({
+        polyline: {
+          positions,
+          width: 2,
+          material: Cesium.Color.fromCssColorString(SELECT_COLOR),
+          clampToGround: true,
+        },
+      })
+    } else {
+      this.drawPolyline.polyline!.positions = new Cesium.ConstantProperty(positions)
+    }
+    if (pts.length >= 3) {
+      const hierarchy = new Cesium.PolygonHierarchy(positions)
+      if (!this.drawPolygon) {
+        this.drawPolygon = this.viewer.entities.add({
+          polygon: {
+            hierarchy,
+            material: Cesium.Color.fromCssColorString(SELECT_COLOR).withAlpha(0.18),
+            outline: false,
+          },
+        })
+      } else {
+        this.drawPolygon.polygon!.hierarchy = new Cesium.ConstantProperty(hierarchy)
+      }
+    }
+  }
+
+  private clearDrawEntities() {
+    if (this.drawPolyline) this.viewer.entities.remove(this.drawPolyline)
+    if (this.drawPolygon) this.viewer.entities.remove(this.drawPolygon)
+    for (const e of this.drawPointEntities) this.viewer.entities.remove(e)
+    this.drawPolyline = null
+    this.drawPolygon = null
+    this.drawPointEntities = []
+  }
+
+  finishDrawing() {
+    if (!this.drawing) return
+    if (this.drawPoints.length < 3) {
+      this.cancelDrawing()
+      return
+    }
+    const unit = this.units.reduce((m, u) => Math.max(m, u.unit), 0) + 1
+    const ring = normalizeRing(this.drawPoints)
+    const u: UnitFeature = {
+      unit,
+      name: `${String(unit).padStart(2, "0")}单元`,
+      grade: 3,
+      ring,
+      ...computeUnitMetrics(ring),
+    }
+    this.units.push(u)
+    this.createUnitEntities(u)
+    this.drawing = false
+    this.drawPoints = []
+    this.clearDrawEntities()
+    this.selected = null
+    this.selectUnit(unit)
+    this.applyUnitStyles()
+    this.updateWash()
+    this.rebuildVertices()
+    this.cb.onUnitsChanged(this.snapshotUnits())
+    this.cb.onEditState(this.editState())
+  }
+
+  cancelDrawing() {
+    this.drawing = false
+    this.drawPoints = []
+    this.clearDrawEntities()
+    this.cb.onEditState(this.editState())
+  }
+
+  saveEdits() {
+    storeUnits(this.units)
+    this.cb.onUnitsChanged(this.snapshotUnits())
+  }
+
+  async revertEdits() {
+    this.removeAllUnitEntities()
+    this.units = loadStoredUnits() ?? (await loadUnits(UNITS_URL))
+    this.selected = null
+    this.drawing = false
+    this.clearDrawEntities()
+    this.addUnitEntities()
+    this.applyUnitStyles()
+    this.updateWash()
+    this.rebuildVertices()
+    this.cb.onUnitsChanged(this.snapshotUnits())
+    this.cb.onSelectChange(null)
+    this.cb.onEditState(this.editState())
+  }
+
+  async resetUnits() {
+    clearStoredUnits()
+    await this.revertEdits()
+  }
+
+  deleteSelectedUnit() {
+    if (this.selected === null) return
+    const unit = this.selected
+    this.units = this.units.filter((u) => u.unit !== unit)
+    for (const map of [this.fills, this.outlines, this.labels]) {
+      const e = map.get(unit)
+      if (e) this.viewer.entities.remove(e)
+      map.delete(unit)
+    }
+    this.selected = null
+    this.applyClip()
+    this.applyUnitStyles()
+    this.updateWash()
+    this.rebuildVertices()
+    this.cb.onUnitsChanged(this.snapshotUnits())
+    this.cb.onSelectChange(null)
+  }
+
+  exportUnitsJson(): string {
+    return JSON.stringify(unitsToGeoJson(this.units), null, 2)
+  }
+
+  private removeAllUnitEntities() {
+    for (const e of [...this.fills.values(), ...this.outlines.values(), ...this.labels.values()]) {
+      this.viewer.entities.remove(e)
+    }
+    this.fills.clear()
+    this.outlines.clear()
+    this.labels.clear()
+    this.clearVertices()
+  }
+
   private flyToUnit(u: UnitFeature) {
     const sphere = Cesium.BoundingSphere.fromPoints(this.ringPositions(u))
     const range = Math.max(190, sphere.radius * 2.2)
@@ -362,11 +810,17 @@ export class PlatformController {
         return
       }
       this.flyToUnit(u)
+      // 等相机到位、瓦片渲染稳定后按真实模型表面重贴顶点
+      window.setTimeout(() => {
+        if (!this.destroyed && this.editMode && this.selected === u.unit) this.rebuildVertices()
+      }, 1800)
     }
     this.applyClip()
     this.applyUnitStyles()
     this.updateWash()
+    this.rebuildVertices()
     this.cb.onSelectChange(unit)
+    this.cb.onEditState(this.editState())
   }
 
   setClipEnabled(enabled: boolean) {
@@ -384,6 +838,7 @@ export class PlatformController {
   setZOffset(z: number) {
     this.zOffset = z
     this.applyZOffset()
+    this.rebuildVertices()
   }
 
   private applyZOffset() {

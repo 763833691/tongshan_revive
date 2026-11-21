@@ -17,6 +17,46 @@ interface GeoJsonFeature {
   geometry: { coordinates: number[][][] }
 }
 
+export interface UnitGeoJson {
+  type: string
+  features: GeoJsonFeature[]
+}
+
+export const UNITS_STORAGE_KEY = "tongshan.units.v1"
+
+export function unitsFromGeoJson(gj: UnitGeoJson): UnitFeature[] {
+  return gj.features.map((f) => {
+    const ring = normalizeRing(f.geometry.coordinates[0] as [number, number][])
+    return {
+      unit: f.properties.unit,
+      name: f.properties.name,
+      grade: f.properties.grade,
+      ring,
+      ...computeUnitMetrics(ring),
+    }
+  })
+}
+
+export function loadStoredUnits(): UnitFeature[] | null {
+  try {
+    const raw = localStorage.getItem(UNITS_STORAGE_KEY)
+    if (!raw) return null
+    const gj = JSON.parse(raw) as UnitGeoJson
+    if (!gj?.features?.length) return null
+    return unitsFromGeoJson(gj)
+  } catch {
+    return null
+  }
+}
+
+export function storeUnits(units: UnitFeature[]) {
+  localStorage.setItem(UNITS_STORAGE_KEY, JSON.stringify(unitsToGeoJson(units)))
+}
+
+export function clearStoredUnits() {
+  localStorage.removeItem(UNITS_STORAGE_KEY)
+}
+
 const EARTH_RADIUS = 6371008.8
 
 export function haversineMeters(a: [number, number], b: [number, number]): number {
@@ -51,34 +91,73 @@ export function pointInRing(lon: number, lat: number, ring: [number, number][]):
 export async function loadUnits(url: string): Promise<UnitFeature[]> {
   const res = await fetch(url)
   if (!res.ok) throw new Error(`单元数据加载失败: ${res.status}`)
-  const gj = (await res.json()) as { features: GeoJsonFeature[] }
-  return gj.features.map((f) => {
-    const ring = f.geometry.coordinates[0] as [number, number][]
-    let sx = 0
-    let sy = 0
-    let west = Number.POSITIVE_INFINITY
-    let south = Number.POSITIVE_INFINITY
-    let east = Number.NEGATIVE_INFINITY
-    let north = Number.NEGATIVE_INFINITY
-    // 去掉闭合重复点参与质心/包络计算
-    const pts = ring.slice(0, ring.length - 1)
-    for (const [x, y] of pts) {
-      sx += x
-      sy += y
-      if (x < west) west = x
-      if (x > east) east = x
-      if (y < south) south = y
-      if (y > north) north = y
-    }
-    return {
-      unit: f.properties.unit,
-      name: f.properties.name,
-      areaHa: f.properties.area_ha,
-      grade: f.properties.grade,
-      ring,
-      centroid: [sx / pts.length, sy / pts.length],
-      perimeterM: ringPerimeterMeters(ring),
-      bbox: { west, south, east, north },
-    }
-  })
+  return unitsFromGeoJson((await res.json()) as UnitGeoJson)
+}
+
+/** 保证环闭合（末点=首点） */
+export function normalizeRing(points: [number, number][]): [number, number][] {
+  const pts = points.filter((p, i) => i === 0 || p[0] !== points[i - 1][0] || p[1] !== points[i - 1][1])
+  if (!pts.length) return []
+  const first = pts[0]
+  const last = pts[pts.length - 1]
+  return first[0] === last[0] && first[1] === last[1] ? pts : [...pts, [first[0], first[1]]]
+}
+
+/** 球面/局部平面近似的面积（公顷），仅用于编辑后重算 */
+export function ringAreaHa(ring: [number, number][]): number {
+  const pts = ring.slice(0, Math.max(0, ring.length - 1))
+  if (pts.length < 3) return 0
+  const lat0 = pts.reduce((s, p) => s + p[1], 0) / pts.length
+  const mPerDegLat = 111132.92
+  const mPerDegLon = 111320 * Math.cos((lat0 * Math.PI) / 180)
+  let area2 = 0
+  for (let i = 0; i < pts.length; i++) {
+    const [x1, y1] = pts[i]
+    const [x2, y2] = pts[(i + 1) % pts.length]
+    area2 += x1 * mPerDegLon * (y2 * mPerDegLat) - x2 * mPerDegLon * (y1 * mPerDegLat)
+  }
+  return Math.abs(area2 / 2) / 10000
+}
+
+/** 编辑后重算质心、周长、面积、包络 */
+export function computeUnitMetrics(ring: [number, number][]) {
+  const closed = normalizeRing(ring)
+  const pts = closed.slice(0, Math.max(0, closed.length - 1))
+  let sx = 0
+  let sy = 0
+  let west = Number.POSITIVE_INFINITY
+  let south = Number.POSITIVE_INFINITY
+  let east = Number.NEGATIVE_INFINITY
+  let north = Number.NEGATIVE_INFINITY
+  for (const [x, y] of pts) {
+    sx += x
+    sy += y
+    if (x < west) west = x
+    if (x > east) east = x
+    if (y < south) south = y
+    if (y > north) north = y
+  }
+  return {
+    areaHa: ringAreaHa(closed),
+    centroid: [(sx / pts.length) as number, (sy / pts.length) as number] as [number, number],
+    perimeterM: ringPerimeterMeters(closed),
+    bbox: { west, south, east, north },
+  }
+}
+
+/** 导出为可回写的 GeoJSON（properties 字段与导入一致） */
+export function unitsToGeoJson(units: UnitFeature[]) {
+  return {
+    type: "FeatureCollection",
+    features: units.map((u) => ({
+      type: "Feature",
+      properties: {
+        unit: u.unit,
+        name: u.name,
+        area_ha: Number(u.areaHa.toFixed(3)),
+        grade: u.grade,
+      },
+      geometry: { type: "Polygon", coordinates: [u.ring] },
+    })),
+  }
 }

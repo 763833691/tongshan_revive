@@ -9,6 +9,8 @@ interface Props {
   baseLayer: BaseLayerKind
   onBaseLayer: (k: BaseLayerKind) => void
   onHome: () => void
+  editMode: boolean
+  onEditMode: (b: boolean) => void
   selected: number | null
   onClear: () => void
 }
@@ -63,6 +65,17 @@ export function TopBar(p: Props) {
         }`}
       >
         体量预览
+      </button>
+
+      <button
+        onClick={() => p.onEditMode(!p.editMode)}
+        className={`h-8 px-3 text-xs rounded-lg border transition-colors duration-150 cursor-pointer whitespace-nowrap ${
+          p.editMode
+            ? "bg-cinnabar border-cinnabar text-paper"
+            : "border-ink-700 text-sand/80 hover:text-paper"
+        }`}
+      >
+        编辑边界
       </button>
 
       <button
