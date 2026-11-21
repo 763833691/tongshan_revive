@@ -12,19 +12,26 @@ interface Props {
   onFinishDrawing: () => void
   onCancelDrawing: () => void
   onExport: () => void
+  onTool: (tool: "drag" | "add" | "delete") => void
+  onUndo: () => void
 }
+
+type Tool = "drag" | "add" | "delete"
 
 function Btn({
   onClick,
   children,
   tone = "default",
+  active = false,
 }: {
   onClick: () => void
   children: React.ReactNode
   tone?: "default" | "primary" | "danger"
+  active?: boolean
 }) {
-  const cls =
-    tone === "primary"
+  const cls = active
+    ? "bg-cinnabar border-cinnabar text-paper"
+    : tone === "primary"
       ? "bg-cinnabar/20 border-cinnabar/60 text-cinnabar hover:bg-cinnabar hover:text-paper"
       : tone === "danger"
         ? "bg-ink-800 border-red-500/40 text-red-300 hover:bg-red-500/20"
@@ -41,6 +48,11 @@ function Btn({
 
 export function EditorPanel(p: Props) {
   const [saved, setSaved] = useState(false)
+  const [tool, setTool] = useState<Tool>("drag")
+  const pickTool = (t: Tool) => {
+    setTool(t)
+    p.onTool(t)
+  }
   return (
     <div className="absolute left-3 bottom-12 z-20 w-[330px] rounded-xl bg-ink-900/95 backdrop-blur border border-ink-700 shadow-xl p-3 space-y-2.5">
       <div className="flex items-center justify-between">
@@ -72,9 +84,25 @@ export function EditorPanel(p: Props) {
         </div>
       ) : p.selected !== null ? (
         <div className="space-y-2">
+          <div className="flex items-center gap-1.5">
+            <Btn onClick={() => pickTool("drag")} active={tool === "drag"}>
+              拖拽
+            </Btn>
+            <Btn onClick={() => pickTool("add")} active={tool === "add"}>
+              加点
+            </Btn>
+            <Btn onClick={() => pickTool("delete")} active={tool === "delete"}>
+              删点
+            </Btn>
+            <div className="flex-1" />
+            <Btn onClick={p.onUndo}>撤销</Btn>
+          </div>
           <p className="text-[11px] leading-relaxed text-sand/70">
-            当前单元 <span className="text-paper font-semibold">{String(p.selected).padStart(2, "0")}</span>
-            ：拖拽白点改边界，点黄点插入顶点，右键白点删除（至少保留 3 点）。
+            {tool === "drag"
+              ? "拖拽白点移动边界；与相邻单元共用的顶点会同步移动。"
+              : tool === "add"
+                ? "点击边界线附近，会在最近的线段上插入顶点；相邻单元同步加点和变形。"
+                : "点击白点删除顶点（至少保留 3 点）；相邻单元的同名顶点同步删除。"}
           </p>
           <div className="flex flex-wrap items-center gap-1.5">
             <Btn
@@ -92,6 +120,7 @@ export function EditorPanel(p: Props) {
               删除单元
             </Btn>
           </div>
+          <p className="text-[10px] text-sand/40">共享边界双向同步：改动会同时写入相邻单元。</p>
         </div>
       ) : (
         <p className="text-[11px] leading-relaxed text-sand/70">

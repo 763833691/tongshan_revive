@@ -86,8 +86,11 @@ export class PlatformController {
   private drawing = false
   private drawPoints: [number, number][] = []
   private vertexEntities: Cesium.Entity[] = []
-  private midEntities: Cesium.Entity[] = []
   private dragIndex: number | null = null
+  private dragGroup: { unit: number; index: number }[] = []
+  private suppressClickUntil = 0
+  private editTool: "drag" | "add" | "delete" = "drag"
+  private undoStack: { unit: number; ring: [number, number][] }[][] = []
   private drawPolyline: Cesium.Entity | null = null
   private drawPolygon: Cesium.Entity | null = null
   private drawPointEntities: Cesium.Entity[] = []
@@ -179,8 +182,17 @@ export class PlatformController {
   }
 
   private onLeftClick(screen: Cesium.Cartesian2) {
+    if (performance.now() < this.suppressClickUntil) return
     if (this.drawing) {
       this.addDrawPoint(screen)
+      return
+    }
+    if (this.editMode && this.editTool === "add") {
+      this.addVertexAtPoint(screen)
+      return
+    }
+    if (this.editMode && this.editTool === "delete") {
+      this.deleteVertexAt(screen)
       return
     }
     if (this.measureMode !== "none" && !this.measureFinished) {
@@ -211,26 +223,20 @@ export class PlatformController {
   }
 
   private onLeftDown(screen: Cesium.Cartesian2) {
-    if (!this.editMode || this.drawing) return
-    const picked = this.viewer.scene.pick(screen)
-    const id = picked?.id
-    if (!(id instanceof Cesium.Entity)) return
-    const props = id.properties as Cesium.PropertyBag | undefined
-    const vertex = props?.editVertex?.getValue()
-    if (typeof vertex === "number") {
-      this.dragIndex = vertex
-      this.viewer.scene.screenSpaceCameraController.enableRotate = false
-      return
-    }
-    const mid = props?.editMid?.getValue()
-    if (typeof mid === "number") this.insertVertex(mid)
+    if (!this.editMode || this.drawing || this.editTool !== "drag") return
+    const vertex = this.nearestVertex(screen)
+    if (vertex === null) return
+    this.dragIndex = vertex
+    this.suppressClickUntil = performance.now() + 400
+    this.beginDragGroup(vertex)
+    this.viewer.scene.screenSpaceCameraController.enableRotate = false
   }
 
   private onLeftUp() {
     if (this.dragIndex === null) return
     this.dragIndex = null
     this.viewer.scene.screenSpaceCameraController.enableRotate = true
-    this.commitCurrentUnit()
+    this.commitDragGroup()
   }
 
   private onRightClick(screen: Cesium.Cartesian2) {
@@ -238,12 +244,7 @@ export class PlatformController {
       this.finishDrawing()
       return
     }
-    if (!this.editMode) return
-    const picked = this.viewer.scene.pick(screen)
-    const id = picked?.id
-    if (!(id instanceof Cesium.Entity)) return
-    const vertex = (id.properties as Cesium.PropertyBag | undefined)?.editVertex?.getValue()
-    if (typeof vertex === "number") this.deleteVertex(vertex)
+    void screen
   }
 
   async init() {
@@ -494,9 +495,8 @@ export class PlatformController {
   }
 
   private clearVertices() {
-    for (const e of [...this.vertexEntities, ...this.midEntities]) this.viewer.entities.remove(e)
+    for (const e of this.vertexEntities) this.viewer.entities.remove(e)
     this.vertexEntities = []
-    this.midEntities = []
   }
 
   /** 顶点贴到模型/地表实际高度，避免悬空 */
@@ -525,7 +525,7 @@ export class PlatformController {
           position: this.surfacePosition(lon, lat),
           properties: { editVertex: index, editUnit: u.unit },
           point: {
-            pixelSize: 11,
+            pixelSize: 12,
             color: Cesium.Color.WHITE,
             outlineColor: Cesium.Color.fromCssColorString(SELECT_COLOR),
             outlineWidth: 2,
@@ -534,79 +534,205 @@ export class PlatformController {
         }),
       )
     })
-    for (let i = 0; i < pts.length; i++) {
-      const a = pts[i]
-      const b = pts[(i + 1) % pts.length]
-      this.midEntities.push(
-        this.viewer.entities.add({
-          position: this.surfacePosition((a[0] + b[0]) / 2, (a[1] + b[1]) / 2),
-          properties: { editMid: i, editUnit: u.unit },
-          point: {
-            pixelSize: 7,
-            color: Cesium.Color.fromCssColorString("#ffd166").withAlpha(0.9),
-            disableDepthTestDistance: Number.POSITIVE_INFINITY,
-          },
-        }),
-      )
+  }
+
+  private samePoint(a: [number, number], b: [number, number]) {
+    const tol = 2e-6
+    return Math.abs(a[0] - b[0]) < tol && Math.abs(a[1] - b[1]) < tol
+  }
+
+  /** 与当前顶点重合的其他单元顶点（共享边界） */
+  private sharedVertices(unit: number, index: number): { unit: number; index: number }[] {
+    const u = this.units.find((x) => x.unit === unit)
+    if (!u) return []
+    const pos = u.ring[index]
+    const out: { unit: number; index: number }[] = []
+    for (const v of this.units) {
+      if (v.unit === unit) continue
+      const open = v.ring.length - 1
+      for (let i = 0; i < open; i++) {
+        if (this.samePoint(v.ring[i], pos)) out.push({ unit: v.unit, index: i })
+      }
     }
+    return out
+  }
+
+  /** 与给定线段两端点重合的相邻单元线段 */
+  private sharedSegments(unit: number, a: [number, number], b: [number, number]): { unit: number; index: number }[] {
+    const out: { unit: number; index: number }[] = []
+    for (const v of this.units) {
+      if (v.unit === unit) continue
+      const open = v.ring.length - 1
+      for (let i = 0; i < open; i++) {
+        const c = v.ring[i]
+        const d = v.ring[(i + 1) % open]
+        if ((this.samePoint(a, c) && this.samePoint(b, d)) || (this.samePoint(a, d) && this.samePoint(b, c))) {
+          out.push({ unit: v.unit, index: i })
+        }
+      }
+    }
+    return out
+  }
+
+  private pushUndo(units: number[]) {
+    const metas = [...new Set(units)].map((unit) => {
+      const u = this.units.find((x) => x.unit === unit)
+      return u ? { unit, ring: u.ring.map(([lon, lat]) => [lon, lat] as [number, number]) } : null
+    })
+    this.undoStack.push(metas.filter((m): m is { unit: number; ring: [number, number][] } => m !== null))
+    if (this.undoStack.length > 80) this.undoStack.shift()
+  }
+
+  undo() {
+    const snap = this.undoStack.pop()
+    if (!snap) return
+    for (const { unit, ring } of snap) {
+      const u = this.units.find((x) => x.unit === unit)
+      if (u) u.ring = normalizeRing(ring)
+    }
+    this.finalizeUnits(snap.map((s) => s.unit))
+  }
+
+  private finalizeUnits(units: number[]) {
+    for (const unit of new Set(units)) {
+      const u = this.units.find((x) => x.unit === unit)
+      if (!u) continue
+      u.ring = normalizeRing(u.ring)
+      Object.assign(u, computeUnitMetrics(u.ring))
+      this.refreshUnitGeometry(u)
+    }
+    if (this.clipEnabled) this.applyClip()
+    this.rebuildVertices()
+    this.applyUnitStyles()
+    this.updateWash()
+    this.cb.onUnitsChanged(this.snapshotUnits())
+  }
+
+  private setRingPoint(u: UnitFeature, index: number, lon: number, lat: number) {
+    const open = u.ring.length - 1
+    if (index < 0 || index >= open) return
+    u.ring[index] = [lon, lat]
+    if (index === 0) u.ring[open] = [lon, lat]
+  }
+
+  private beginDragGroup(index: number) {
+    if (this.selected === null) return
+    this.dragGroup = [{ unit: this.selected, index }, ...this.sharedVertices(this.selected, index)]
+    this.pushUndo(this.dragGroup.map((g) => g.unit))
   }
 
   private updateDrag(screen: Cesium.Cartesian2) {
-    if (this.dragIndex === null || this.selected === null) return
+    if (this.dragIndex === null || !this.dragGroup.length) return
     const cart = this.pickGroundPosition(screen)
     if (!cart) return
-    const u = this.units.find((x) => x.unit === this.selected)
-    if (!u) return
     const carto = Cesium.Cartographic.fromCartesian(cart)
     const lon = Cesium.Math.toDegrees(carto.longitude)
     const lat = Cesium.Math.toDegrees(carto.latitude)
-    u.ring[this.dragIndex] = [lon, lat]
-    if (this.dragIndex === 0) u.ring[u.ring.length - 1] = [lon, lat]
-    this.refreshUnitGeometry(u)
+    for (const g of this.dragGroup) {
+      const u = this.units.find((x) => x.unit === g.unit)
+      if (!u) continue
+      this.setRingPoint(u, g.index, lon, lat)
+      this.refreshUnitGeometry(u)
+    }
     const v = this.vertexEntities[this.dragIndex]
     if (v) v.position = new Cesium.ConstantPositionProperty(this.surfacePosition(lon, lat))
   }
 
-  private insertVertex(midIndex: number) {
+  private commitDragGroup() {
+    if (!this.dragGroup.length) return
+    const units = this.dragGroup.map((g) => g.unit)
+    this.dragGroup = []
+    this.finalizeUnits(units)
+    if (this.selected !== null) this.applyClip()
+  }
+
+  /** 按屏幕距离找最近的顶点（顶点会被地面填充遮挡，不能依赖 scene.pick） */
+  private nearestVertex(screen: Cesium.Cartesian2): number | null {
+    if (!this.vertexEntities.length) return null
+    const now = this.viewer.clock.currentTime
+    const rect = this.viewer.scene.canvas.getBoundingClientRect()
+    const sx = screen.x + rect.left
+    const sy = screen.y + rect.top
+    let best = { index: -1, dist: 18 }
+    this.vertexEntities.forEach((e, index) => {
+      const position = e.position?.getValue(now)
+      if (!position) return
+      const w = Cesium.SceneTransforms.worldToWindowCoordinates(this.viewer.scene, position)
+      if (!w) return
+      const dist = Math.hypot(sx - w.x, sy - w.y)
+      if (dist < best.dist) best = { index, dist }
+    })
+    return best.index >= 0 ? best.index : null
+  }
+
+  private addVertexAtPoint(screen: Cesium.Cartesian2) {
     if (this.selected === null) return
     const u = this.units.find((x) => x.unit === this.selected)
     if (!u) return
     const pts = u.ring.slice(0, -1)
-    const a = pts[midIndex]
-    const b = pts[(midIndex + 1) % pts.length]
-    pts.splice(midIndex + 1, 0, [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2])
+    if (pts.length < 3 || this.vertexEntities.length !== pts.length) return
+    const now = this.viewer.clock.currentTime
+    // 事件坐标相对画布；worldToWindowCoordinates 返回页面坐标，需补齐画布偏移
+    const rect = this.viewer.scene.canvas.getBoundingClientRect()
+    const sx = screen.x + rect.left
+    const sy = screen.y + rect.top
+    let best = { index: -1, t: 0, dist: Number.POSITIVE_INFINITY }
+    for (let i = 0; i < pts.length; i++) {
+      const a = this.vertexEntities[i]?.position?.getValue(now)
+      const b = this.vertexEntities[(i + 1) % pts.length]?.position?.getValue(now)
+      if (!a || !b) continue
+      const w1 = Cesium.SceneTransforms.worldToWindowCoordinates(this.viewer.scene, a)
+      const w2 = Cesium.SceneTransforms.worldToWindowCoordinates(this.viewer.scene, b)
+      if (!w1 || !w2) continue
+      const vx = w2.x - w1.x
+      const vy = w2.y - w1.y
+      const len2 = vx * vx + vy * vy
+      const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((sx - w1.x) * vx + (sy - w1.y) * vy) / len2))
+      const dist = Math.hypot(sx - (w1.x + vx * t), sy - (w1.y + vy * t))
+      if (dist < best.dist) best = { index: i, t, dist }
+    }
+    // 只在贴近边界线、且不落在端点附近时插点
+    if (best.index < 0 || best.dist > 14 || best.t < 0.02 || best.t > 0.98) return
+    const a = pts[best.index]
+    const b = pts[(best.index + 1) % pts.length]
+    const point: [number, number] = [a[0] + (b[0] - a[0]) * best.t, a[1] + (b[1] - a[1]) * best.t]
+    const shared = this.sharedSegments(u.unit, a, b)
+    this.pushUndo([u.unit, ...shared.map((s) => s.unit)])
+    pts.splice(best.index + 1, 0, point)
     u.ring = normalizeRing(pts)
-    Object.assign(u, computeUnitMetrics(u.ring))
-    this.refreshUnitGeometry(u)
-    this.rebuildVertices()
-    this.cb.onUnitsChanged(this.snapshotUnits())
+    for (const s of shared) {
+      const v = this.units.find((x) => x.unit === s.unit)
+      if (!v) continue
+      const vp = v.ring.slice(0, -1)
+      vp.splice(s.index + 1, 0, [point[0], point[1]])
+      v.ring = normalizeRing(vp)
+    }
+    this.finalizeUnits([u.unit, ...shared.map((s) => s.unit)])
   }
 
-  private deleteVertex(index: number) {
+  private deleteVertexAt(screen: Cesium.Cartesian2) {
     if (this.selected === null) return
+    const index = this.nearestVertex(screen)
+    if (index === null) return
     const u = this.units.find((x) => x.unit === this.selected)
     if (!u) return
-    const pts = u.ring.slice(0, -1)
-    if (pts.length <= 3) return
-    pts.splice(index, 1)
-    u.ring = normalizeRing(pts)
-    Object.assign(u, computeUnitMetrics(u.ring))
-    this.refreshUnitGeometry(u)
-    this.rebuildVertices()
-    this.cb.onUnitsChanged(this.snapshotUnits())
+    if (u.ring.length - 1 <= 3) return
+    const group = [{ unit: u.unit, index }, ...this.sharedVertices(u.unit, index)]
+    this.pushUndo(group.map((g) => g.unit))
+    for (const g of group) {
+      const v = this.units.find((x) => x.unit === g.unit)
+      if (!v) continue
+      const vp = v.ring.slice(0, -1)
+      if (vp.length <= 3) continue
+      vp.splice(g.index, 1)
+      v.ring = normalizeRing(vp)
+    }
+    this.finalizeUnits(group.map((g) => g.unit))
   }
 
-  private commitCurrentUnit() {
-    if (this.selected === null) return
-    const u = this.units.find((x) => x.unit === this.selected)
-    if (!u) return
-    u.ring = normalizeRing(u.ring)
-    Object.assign(u, computeUnitMetrics(u.ring))
-    this.refreshUnitGeometry(u)
-    if (this.clipEnabled) this.applyClip()
+  setEditTool(tool: "drag" | "add" | "delete") {
+    this.editTool = tool
     this.rebuildVertices()
-    this.applyUnitStyles()
-    this.cb.onUnitsChanged(this.snapshotUnits())
   }
 
   setEditMode(on: boolean) {

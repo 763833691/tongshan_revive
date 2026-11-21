@@ -158,6 +158,8 @@ export default function App() {
               onStartDrawing={() => controllerRef.current?.startDrawing()}
               onFinishDrawing={() => controllerRef.current?.finishDrawing()}
               onCancelDrawing={() => controllerRef.current?.cancelDrawing()}
+              onTool={(t) => controllerRef.current?.setEditTool(t)}
+              onUndo={() => controllerRef.current?.undo()}
               onExport={() => {
                 const json = controllerRef.current?.exportUnitsJson()
                 if (!json) return
