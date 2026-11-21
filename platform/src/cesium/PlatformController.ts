@@ -97,6 +97,9 @@ export class PlatformController {
     })
     this.viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString("#0e2a30")
     this.viewer.scene.screenSpaceCameraController.enableCollisionDetection = false
+    // 卫星底图贴在椭球面上，必须让球面不参与深度遮挡，
+    // 否则模型地表略低于椭球面时会被底图盖住（看起来像“卫星图在模型上面”）。
+    this.viewer.scene.globe.depthTestAgainstTerrain = false
     this.setBaseLayer("satellite")
 
     if (import.meta.env.DEV) {
