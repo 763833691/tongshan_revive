@@ -1,0 +1,65 @@
+# 铜山古城数字孪生平台 —— Nginx 参考配置
+# 放置到 /etc/nginx/conf.d/tongshan.conf（Linux）或 nginx/conf/ 下按需修改。
+#
+# 目录约定：
+#   /srv/tongshan/dist/                 Vite 构建产物（index.html、assets/、cesium/、data/）
+#   /srv/tongshan/3dtiles/tongshan/     12 GB 3D Tiles（tileset.json + Data/）
+#
+# 构建时使用外链瓦片：
+#   VITE_TILESET_PATH=/3dtiles/tongshan/tileset.json npm run build
+
+server {
+    listen       80;
+    server_name  tongshan.local;
+
+    root  /srv/tongshan/dist;
+    index index.html;
+
+    # 只压缩文本类资源；b3dm 已由转换工具压缩，再 gzip 收益很低
+    gzip              on;
+    gzip_min_length   1024;
+    gzip_comp_level   5;
+    gzip_types        application/json application/javascript text/css text/plain image/svg+xml;
+
+    # 前端单页应用
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # 三维瓦片：独立目录 + CORS（支持 ?tileset= 跨域加载）
+    # 用 root 而不是 alias，配合 try_files 更稳妥
+    location /3dtiles/ {
+        root /srv/tongshan;
+
+        add_header Access-Control-Allow-Origin  "*" always;
+        add_header Access-Control-Allow-Methods "GET, HEAD, OPTIONS" always;
+        add_header Access-Control-Allow-Headers "Range" always;
+        add_header Cache-Control "public, max-age=604800" always;
+
+        # b3dm / glb 需要正确 MIME，避免被当成文本下载
+        types {
+            application/json            json;
+            application/octet-stream    b3dm;
+            model/gltf-binary           glb;
+            model/gltf+json             gltf;
+            image/jpeg                  jpg jpeg;
+            image/png                   png;
+            image/webp                  webp;
+            application/wasm            wasm;
+        }
+
+        try_files $uri =404;
+    }
+
+    # Cesium 运行时资源（Workers/Assets/Widgets/ThirdParty）
+    location /cesium/ {
+        add_header Cache-Control "public, max-age=2592000, immutable" always;
+        try_files $uri =404;
+    }
+
+    # 带哈希的前端静态资源可长缓存
+    location /assets/ {
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        try_files $uri =404;
+    }
+}

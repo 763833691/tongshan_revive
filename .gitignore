@@ -1,0 +1,17 @@
+# 原始测绘/转换数据，体积过大，不入代码仓库
+terra_osgbs/
+terra_osgbs.zip
+scene/
+_work/
+
+# 三维瓦片（11.16 GB）
+platform/public/3dtiles/
+
+# 依赖与构建产物
+platform/node_modules/
+platform/dist/
+
+# 日志与系统文件
+*.log
+.DS_Store
+Thumbs.db
