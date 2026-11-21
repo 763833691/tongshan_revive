@@ -2,6 +2,7 @@ import * as Cesium from "cesium"
 import "cesium/Build/Cesium/Widgets/widgets.css"
 import {
   CAMERA_MIN_PITCH_DEG,
+  GLOBE_HIDE_BELOW_HEIGHT,
   GRADE_COLOR,
   HOME_CENTER,
   HOME_HEIGHT,
@@ -77,6 +78,7 @@ export class PlatformController {
   private lastProgressEmit = 0
   private flightEndsAt = 0
   private clamping = false
+  private nearGlobeHidden = false
 
   constructor(container: HTMLElement, cb: ControllerCallbacks) {
     this.cb = cb
@@ -126,6 +128,7 @@ export class PlatformController {
       canvas.style.cursor = picked?.id instanceof Cesium.Entity ? "pointer" : "default"
     }, Cesium.ScreenSpaceEventType.MOUSE_MOVE)
     this.viewer.scene.preRender.addEventListener(this.clampCameraPitch)
+    this.viewer.scene.preRender.addEventListener(this.updateGlobeVisibility)
   }
 
   async init() {
@@ -628,9 +631,26 @@ export class PlatformController {
     }
   }
 
+  /** 拉近后隐藏卫星球面，防止底图浮到模型上方；拉远时恢复 */
+  private updateGlobeVisibility = () => {
+    if (this.destroyed || !this.tileset) return
+    const scene = this.viewer.scene
+    const h = this.viewer.camera.positionCartographic.height
+    const bs = this.tileset.boundingSphere
+    const inModelArea =
+      Cesium.Cartesian3.distance(this.viewer.camera.positionWC, bs.center) < bs.radius * 1.2
+    const hide = inModelArea && (this.nearGlobeHidden ? h < GLOBE_HIDE_BELOW_HEIGHT + 80 : h < GLOBE_HIDE_BELOW_HEIGHT)
+    if (hide === this.nearGlobeHidden) return
+    this.nearGlobeHidden = hide
+    scene.globe.show = !hide
+    if (scene.skyBox) scene.skyBox.show = !hide
+    if (hide) scene.backgroundColor = Cesium.Color.fromCssColorString("#0e2a30")
+  }
+
   destroy() {
     this.destroyed = true
     this.viewer.scene.preRender.removeEventListener(this.clampCameraPitch)
+    this.viewer.scene.preRender.removeEventListener(this.updateGlobeVisibility)
     this.handler.destroy()
     this.viewer.destroy()
   }

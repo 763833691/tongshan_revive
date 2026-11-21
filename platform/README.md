@@ -54,6 +54,7 @@ npm run lint    # ESLint（shadcn/ui 生成组件已单独放宽规则）
 | 面积测量 | 连续取点，水平投影面积（m² / 公顷） |
 | 视角书签 | localStorage 持久化，最多 20 条，一键回到保存视角 |
 | 俯角下限 | 相机至少向下 15°（`CAMERA_MIN_PITCH_DEG`），避免贴近水平时远景影像/模型拉伸 |
+| 近景底图 | 相机低于 450 m 且位于模型范围内时自动隐藏卫星球面，防止底图浮到模型上方；拉远恢复 |
 | 底图切换 | **卫星影像（默认）** / 街道底图 OSM / 无底图；**不使用 GCJ-02 加密底图** |
 | 海面 | 卫星影像直接铺满周边海域，并透过模型水面破洞显示真实海面 |
 | 加载状态 | 瓦片调度中/排队数、模型缺失时的接入指引 |
@@ -81,6 +82,7 @@ HOME_CENTER         // 全城视角中心 117.529519, 23.737031
 HOME_HEIGHT         // 全城视角相机高度 620 m
 Z_OFFSET_DEFAULT    // 模型高程偏移，实测 +30 m
 CAMERA_MIN_PITCH_DEG // 相机最低俯角 -15°（限制过度侧视）
+GLOBE_HIDE_BELOW_HEIGHT // 近景隐藏卫星底图的高度阈值 450 m（带回差）
 DEFAULT_BASE_LAYER  // 默认卫星影像 satellite
 SATELLITE_URL       // Esri World Imagery 瓦片模板（WGS84/WebMercator）
 SATELLITE_MAX_LEVEL // Esri 最高 18 级，避开 19 级灰色占位瓦片
@@ -235,6 +237,7 @@ robocopy .\platform\public\3dtiles \\server\share\tongshan\3dtiles /MIR /R:2 /W:
 - 城墙等 CAD 图层尚未叠加（DWG 需先转 GeoJSON）。
 - 当前为单机静态数据，无后端与权限（阶段二 PostGIS + FastAPI/Express）。
 - 模型水面有破洞，目前靠卫星海面透出兜底；要统一水面需阶段三场景修补。
+- 模型地表局部低于 WGS84 椭球面，拉近后卫星球面会浮在模型上方，因此近距离会自动隐藏底图；该现象需在阶段三用实测地形/正射影像彻底校正。
 - 低角度侧视的横向条纹/黑色碎片**仅在软件 WebGL（SwiftShader，如无 GPU 的 headless 截图）下出现**；同一机位用真实显卡（实测 RTX 2080 Ti / ANGLE D3D11）渲染画面正常，故不作为平台缺陷处理。已额外加 -15° 俯角下限兜底；若现场终端仍复现，请记录显卡型号与浏览器 GPU 状态。
 
 **下一步优先级**

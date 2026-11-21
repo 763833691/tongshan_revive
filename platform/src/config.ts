@@ -25,6 +25,11 @@ export const Z_OFFSET_DEFAULT = 30
 // 限制 pitch 不高于 -15°（至少向下看 15°），可避免对岸出现拉伸条带。
 export const CAMERA_MIN_PITCH_DEG = -15
 
+// 近距离自动隐藏卫星底图的高度阈值（米）：
+// 模型地表局部低于椭球面，拉近后卫星球面会浮到模型上方；低于该高度只显示模型，
+// 远景仍保留卫星影像。恢复显示带回差，避免阈值附近闪烁。
+export const GLOBE_HIDE_BELOW_HEIGHT = 450
+
 // 瓦片调度参数：12GB 倾斜模型需要更大的缓存，否则 Cesium 会频繁降级清晰度
 export const TILESET_MAX_SSE = 16
 export const TILESET_CACHE_BYTES = 1024 * 1024 * 1024
