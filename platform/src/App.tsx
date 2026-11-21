@@ -20,7 +20,7 @@ export default function App() {
 
   const [units, setUnits] = useState<UnitFeature[]>([])
   const [selected, setSelected] = useState<number | null>(null)
-  const [clipEnabled, setClipEnabled] = useState(true)
+  const [clipEnabled, setClipEnabled] = useState(false)
   const [extruded, setExtruded] = useState(false)
   const [baseLayer, setBaseLayer] = useState<BaseLayerKind>(DEFAULT_BASE_LAYER)
   const [zOffset, setZOffset] = useState(Z_OFFSET_DEFAULT)
@@ -80,6 +80,7 @@ export default function App() {
           selected={selected}
           loaded={units.length > 0}
           onSelect={(u) => controllerRef.current?.selectUnit(u)}
+          onClear={() => controllerRef.current?.selectUnit(null)}
         />
         <main className="relative flex-1 min-w-0">
           <div ref={containerRef} className="absolute inset-0" />

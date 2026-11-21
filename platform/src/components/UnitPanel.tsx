@@ -6,12 +6,13 @@ interface Props {
   units: UnitFeature[]
   selected: number | null
   onSelect: (unit: number) => void
+  onClear: () => void
   loaded: boolean
 }
 
 type GradeFilter = 0 | 1 | 2 | 3
 
-export function UnitPanel({ units, selected, onSelect, loaded }: Props) {
+export function UnitPanel({ units, selected, onSelect, onClear, loaded }: Props) {
   const [kw, setKw] = useState("")
   const [grade, setGrade] = useState<GradeFilter>(0)
 
@@ -91,15 +92,25 @@ export function UnitPanel({ units, selected, onSelect, loaded }: Props) {
           <div className="rounded-lg bg-ink-850 border border-ink-700 p-3 space-y-2">
             <div className="flex items-center justify-between">
               <span className="font-serif2 text-base text-paper">{selectedUnit.name}</span>
-              <span
-                className="text-[10px] px-1.5 py-0.5 rounded shrink-0"
-                style={{
-                  color: GRADE_META[selectedUnit.grade].color,
-                  border: `1px solid ${GRADE_META[selectedUnit.grade].color}55`,
-                }}
-              >
-                {GRADE_META[selectedUnit.grade].label}
-              </span>
+              <div className="flex items-center gap-1.5">
+                <span
+                  className="text-[10px] px-1.5 py-0.5 rounded shrink-0"
+                  style={{
+                    color: GRADE_META[selectedUnit.grade].color,
+                    border: `1px solid ${GRADE_META[selectedUnit.grade].color}55`,
+                  }}
+                >
+                  {GRADE_META[selectedUnit.grade].label}
+                </span>
+                <button
+                  onClick={onClear}
+                  aria-label="取消选择"
+                  title="取消选择（Esc）"
+                  className="w-6 h-6 shrink-0 rounded-md border border-ink-600 text-sand/70 hover:text-paper hover:border-cinnabar/60 transition-colors cursor-pointer leading-none"
+                >
+                  ×
+                </button>
+              </div>
             </div>
 
             <div className="grid grid-cols-2 gap-1.5">

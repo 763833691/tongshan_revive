@@ -61,7 +61,9 @@ export class PlatformController {
   private labels = new Map<number, Cesium.Entity>()
   private clipColl: Cesium.ClippingPolygonCollection | null = null
   private selected: number | null = null
-  private clipEnabled = true
+  private clipEnabled = false
+  private extruded = false
+  private wash: Cesium.Entity | null = null
   private zOffset = Z_OFFSET_DEFAULT
   private opacity = 1
   private baseKind: BaseLayerKind = "satellite"
@@ -129,6 +131,11 @@ export class PlatformController {
     }, Cesium.ScreenSpaceEventType.MOUSE_MOVE)
     this.viewer.scene.preRender.addEventListener(this.clampCameraPitch)
     this.viewer.scene.preRender.addEventListener(this.updateGlobeVisibility)
+    window.addEventListener("keydown", this.onKeyDown)
+  }
+
+  private onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === "Escape" && this.selected !== null) this.selectUnit(null)
   }
 
   async init() {
@@ -253,23 +260,58 @@ export class PlatformController {
     this.clipColl.enabled = true
   }
 
-  private styleUnit(unit: number, selected: boolean) {
-    const u = this.units.find((x) => x.unit === unit)
-    const o = this.outlines.get(unit)
-    const f = this.fills.get(unit)
+  /** 选中态配色：选中单元高亮，其余单元在“仅高亮”模式下转为灰色，保留边界与填充 */
+  private applyUnitStyles() {
+    const muted = this.selected !== null && !this.clipEnabled
+    for (const u of this.units) {
+      const isSel = u.unit === this.selected
+      const o = this.outlines.get(u.unit)
+      const f = this.fills.get(u.unit)
+      const l = this.labels.get(u.unit)
+      const color = isSel ? SELECT_COLOR : muted ? "#8f959b" : GRADE_COLOR[u.grade]
+      const css = Cesium.Color.fromCssColorString(color)
+      if (o) {
+        o.polyline!.material = new Cesium.ColorMaterialProperty(css.withAlpha(isSel ? 1 : muted ? 0.75 : 0.95))
+        o.polyline!.width = new Cesium.ConstantProperty(isSel ? 3.2 : muted ? 1.3 : 1.6)
+      }
+      if (f) {
+        const alpha = this.extruded ? (isSel ? 0.5 : muted ? 0.2 : 0.5) : isSel ? 0.34 : muted ? 0.12 : 0.26
+        f.polygon!.extrudedHeight = this.extruded ? new Cesium.ConstantProperty(26) : undefined
+        f.polygon!.material = new Cesium.ColorMaterialProperty(css.withAlpha(alpha))
+      }
+      if (l) {
+        l.label!.fillColor = new Cesium.ConstantProperty(
+          Cesium.Color.fromCssColorString(isSel ? "#ffffff" : muted ? "#c9ced3" : "#f0ead8"),
+        )
+      }
+    }
+  }
+
+  /** “仅高亮”模式下用灰色遮罩压暗选中单元以外的场景（含模型与底图） */
+  private updateWash() {
+    if (this.wash) {
+      this.viewer.entities.remove(this.wash)
+      this.wash = null
+    }
+    if (this.selected === null || this.clipEnabled) return
+    const u = this.units.find((x) => x.unit === this.selected)
     if (!u) return
-    const base = selected ? SELECT_COLOR : GRADE_COLOR[u.grade]
-    if (o) {
-      o.polyline!.material = new Cesium.ColorMaterialProperty(
-        Cesium.Color.fromCssColorString(base).withAlpha(selected ? 1 : 0.95),
-      )
-      o.polyline!.width = new Cesium.ConstantProperty(selected ? 3.2 : 1.6)
-    }
-    if (f) {
-      f.polygon!.material = new Cesium.ColorMaterialProperty(
-        Cesium.Color.fromCssColorString(base).withAlpha(selected ? 0.34 : 0.26),
-      )
-    }
+    const d = 0.15
+    const outer = Cesium.Cartesian3.fromDegreesArray([
+      HOME_CENTER.lon - d, HOME_CENTER.lat - d,
+      HOME_CENTER.lon + d, HOME_CENTER.lat - d,
+      HOME_CENTER.lon + d, HOME_CENTER.lat + d,
+      HOME_CENTER.lon - d, HOME_CENTER.lat + d,
+    ])
+    this.wash = this.viewer.entities.add({
+      id: "highlight-wash",
+      polygon: {
+        hierarchy: new Cesium.PolygonHierarchy(outer, [new Cesium.PolygonHierarchy(this.ringPositions(u))]),
+        material: Cesium.Color.fromCssColorString("#6f757b").withAlpha(0.68),
+        outline: false,
+        classificationType: Cesium.ClassificationType.BOTH,
+      },
+    })
   }
 
   /** 从屏幕坐标拾取单元：优先实体，其次按地面点做多边形包含判断 */
@@ -309,8 +351,9 @@ export class PlatformController {
   }
 
   selectUnit(unit: number | null) {
+    // 再次点击同一单元视为取消
+    if (unit !== null && unit === this.selected) unit = null
     if (this.selected === unit) return
-    if (this.selected !== null) this.styleUnit(this.selected, false)
     this.selected = unit
     if (unit !== null) {
       const u = this.units.find((x) => x.unit === unit)
@@ -318,39 +361,24 @@ export class PlatformController {
         this.selected = null
         return
       }
-      this.styleUnit(unit, true)
       this.flyToUnit(u)
-      this.applyClip()
-    } else if (this.clipColl) {
-      this.clipColl.enabled = false
-      this.clipColl.removeAll()
     }
+    this.applyClip()
+    this.applyUnitStyles()
+    this.updateWash()
     this.cb.onSelectChange(unit)
   }
 
   setClipEnabled(enabled: boolean) {
     this.clipEnabled = enabled
     this.applyClip()
+    this.applyUnitStyles()
+    this.updateWash()
   }
 
   setExtruded(extruded: boolean) {
-    for (const u of this.units) {
-      const f = this.fills.get(u.unit)
-      if (!f) continue
-      const selected = u.unit === this.selected
-      const base = selected ? SELECT_COLOR : GRADE_COLOR[u.grade]
-      if (extruded) {
-        f.polygon!.extrudedHeight = new Cesium.ConstantProperty(26)
-        f.polygon!.material = new Cesium.ColorMaterialProperty(
-          Cesium.Color.fromCssColorString(base).withAlpha(0.5),
-        )
-      } else {
-        f.polygon!.extrudedHeight = undefined
-        f.polygon!.material = new Cesium.ColorMaterialProperty(
-          Cesium.Color.fromCssColorString(base).withAlpha(selected ? 0.34 : 0.26),
-        )
-      }
-    }
+    this.extruded = extruded
+    this.applyUnitStyles()
   }
 
   setZOffset(z: number) {
@@ -649,6 +677,7 @@ export class PlatformController {
 
   destroy() {
     this.destroyed = true
+    window.removeEventListener("keydown", this.onKeyDown)
     this.viewer.scene.preRender.removeEventListener(this.clampCameraPitch)
     this.viewer.scene.preRender.removeEventListener(this.updateGlobeVisibility)
     this.handler.destroy()

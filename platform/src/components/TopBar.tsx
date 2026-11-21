@@ -44,7 +44,7 @@ export function TopBar(p: Props) {
       <div className="flex-1" />
 
       <div className="flex items-center gap-1 bg-ink-850 border border-ink-700 rounded-lg p-0.5" role="group" aria-label="显示模式">
-        <SegBtn active={!p.clipEnabled} onClick={() => p.onClipEnabled(false)}>仅高亮</SegBtn>
+        <SegBtn active={!p.clipEnabled} onClick={() => p.onClipEnabled(false)}>灰度高亮</SegBtn>
         <SegBtn active={p.clipEnabled} onClick={() => p.onClipEnabled(true)}>分单元裁剪</SegBtn>
       </div>
 
