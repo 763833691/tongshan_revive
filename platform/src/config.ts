@@ -2,14 +2,17 @@
 export const APP_TITLE = "铜山古城数字孪生平台"
 export const APP_VERSION = "原型 v0.2"
 
-// 三维瓦片服务地址：默认读平台 public 目录。
-// 生产部署可设置 VITE_TILESET_PATH=/3dtiles/tongshan/tileset.json 指向 Nginx 独立目录；
-// 运行时也可用 ?tileset=http://... 临时覆盖。
+// 三维瓦片。优化结果在 H:\tongshan-3dtiles-opt，开发服务器把它挂到 /3dtiles/tongshan-opt。
+// 原来的 11GB 瓦片仍是 ./3dtiles/tongshan/tileset.json，可用 ?tileset= 临时换回。
+// 生产部署把该目录放到 Nginx 的 /3dtiles/tongshan-opt，或设置 VITE_TILESET_PATH。
 export const TILESET_PATH =
-  (import.meta.env.VITE_TILESET_PATH as string | undefined) ?? "./3dtiles/tongshan/tileset.json"
+  (import.meta.env.VITE_TILESET_PATH as string | undefined) ?? "./3dtiles/tongshan-opt/tileset.json"
 
 // 单元边界数据
 export const UNITS_URL = "./data/units.geojson"
+
+// 建筑基底数据（由 CAD 闭合多段线提取，见 _work/cad_buildings/extract_buildings.py）
+export const BUILDINGS_URL = "./data/buildings.geojson"
 
 // 模型覆盖城镇中心（EPSG:4548 -> WGS84），用于初始相机与垂直偏移计算
 export const HOME_CENTER = { lon: 117.529519, lat: 23.737031 }
@@ -28,12 +31,14 @@ export const CAMERA_MIN_PITCH_DEG = -15
 // 近距离自动隐藏卫星底图的高度阈值（米）：
 // 模型地表局部低于椭球面，拉近后卫星球面会浮到模型上方；低于该高度只显示模型，
 // 远景仍保留卫星影像。恢复显示带回差，避免阈值附近闪烁。
-export const GLOBE_HIDE_BELOW_HEIGHT = 450
+export const GLOBE_HIDE_BELOW_HEIGHT = 250
 
-// 瓦片调度参数：12GB 倾斜模型需要更大的缓存，否则 Cesium 会频繁降级清晰度
+// 瓦片调度：屏幕误差 16 才允许拉到 L20–L22 细层。64 会把近景停在模糊父层。
+// 跳级避免把 L15–L19 逐层下完；中心区域保持细层，远处略放松。
 export const TILESET_MAX_SSE = 16
 export const TILESET_CACHE_BYTES = 1024 * 1024 * 1024
 export const TILESET_MAX_CACHE_OVERFLOW_BYTES = 2 * 1024 * 1024 * 1024
+export const TILESET_SKIP_LOD = true
 
 // 底图：satellite（Esri 卫星影像，WGS84/WebMercator，无 GCJ-02 偏移）；
 // osm（街道底图）；none（无底图，仅看模型）
@@ -65,5 +70,22 @@ export const GRADE_COLOR: Record<number, string> = {
 
 // 选中态 / 测量工具配色
 export const SELECT_COLOR = "#ff5a3c"
+// 选中轮廓：金色描边，不改变模型贴图；粗细可在「显示设置」调整
+export const SELECT_OUTLINE_COLOR = "#e8b74a"
+export const SELECT_OUTLINE_WIDTH_DEFAULT = 3
+export const SELECT_OUTLINE_WIDTH_MIN = 1
+export const SELECT_OUTLINE_WIDTH_MAX = 10
 export const MEASURE_DISTANCE_COLOR = "#ffb04a"
 export const MEASURE_AREA_COLOR = "#63c5da"
+
+// 建筑分割审核：每栋建筑候选的审核状态与配色（点位、徽标共用）
+export type BuildingStatus = "pending" | "confirmed" | "rejected"
+
+export const BUILDING_STATUS_META: Record<BuildingStatus, { label: string; color: string }> = {
+  pending: { label: "待审核", color: "#e0b25a" },
+  confirmed: { label: "已确认", color: "#5fbf8a" },
+  rejected: { label: "已剔除", color: "#8f959b" },
+}
+
+// 建筑审核默认只渲染候选点；关闭裁剪后可直接观察模型整体。
+export const BUILDING_CLIP_DEFAULT = true

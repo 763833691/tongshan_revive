@@ -13,6 +13,8 @@ interface Props {
   onEditMode: (b: boolean) => void
   selected: number | null
   onClear: () => void
+  buildingMode: boolean
+  onBuildingMode: (b: boolean) => void
 }
 
 function SegBtn({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
@@ -76,6 +78,18 @@ export function TopBar(p: Props) {
         }`}
       >
         编辑边界
+      </button>
+
+      <button
+        onClick={() => p.onBuildingMode(!p.buildingMode)}
+        className={`h-8 px-3 text-xs rounded-lg border transition-colors duration-150 cursor-pointer whitespace-nowrap ${
+          p.buildingMode
+            ? "bg-ink-700 border-[#5fbf8a]/60 text-[#5fbf8a]"
+            : "border-ink-700 text-sand/80 hover:text-paper"
+        }`}
+        title="按 CAD 建筑基底逐栋分割模型并审核"
+      >
+        建筑审核
       </button>
 
       <button

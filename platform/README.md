@@ -29,6 +29,9 @@ npm run lint    # ESLint（shadcn/ui 生成组件已单独放宽规则）
 ```
 
 > 构建会原样复制 `public/`。若 `public/3dtiles` 在位，`dist` 会多出 **11.16 GB**；最近一次构建是先把该目录临时移出再构建的（`dist` 约 26 MB）。日常预览请用 `npm run dev`，生产环境按 §7 把瓦片独立发布。
+>
+> 磁盘紧张时可跳过 `public/` 构建（不复制 11 GB 瓦片）：
+> `$env:SKIP_PUBLIC='1'; npm run build`，再把 `public/data` 与 `favicon.svg` 拷到 `dist/`。
 
 ### 数据地址覆盖
 
@@ -46,13 +49,18 @@ npm run lint    # ESLint（shadcn/ui 生成组件已单独放宽规则）
 | 分单元裁剪 | `ClippingPolygonCollection({ inverse: true })`，只保留选中单元；可切「仅高亮」 |
 | 点击选取单元 | 点列表或直接点模型/地面，按平面位置做点在多边形内判断 |
 | 分级配色 | 一级 {14, 20}，其余按 `units.geojson` 的 `grade` 字段渲染 |
-| 选中高亮 | 默认「灰度高亮」：选中单元保持彩色，其余场景加灰并保留灰色边界与填充；再次点击选中单元、按 Esc、点卡片 × 或「取消选择」均可退出 |
+| 选中高亮 | 默认「灰度高亮」：选中单元保持**原始贴图、不加红色填充**，仅用金色描边勾勒；其余场景加灰并保留灰色边界与填充；再次点击选中单元、按 Esc、点卡片 × 或「取消选择」均可退出 |
+| 选中描边 | 金色（`#e8b74a`），沿模型表面绘制并做高度平滑；粗细 1–10 px 可在「显示设置 → 选中描边」实时调整，单元与建筑审核共用 |
 | 分单元裁剪 | 可选模式：只保留选中单元的模型，其余单元仍可在灰度高亮模式下查看 |
 | 边界编辑 | 顶部「编辑边界」进入，提供 **拖拽 / 加点 / 删点** 三种工具和撤销；顶点按模型实际表面高度贴合，不再悬空 |
 | 共享边界 | 相邻单元共用的顶点/线段会**双向同步**：拖动、插点、删点会同时改写两侧单元 |
 | 新增区域 | 「+ 新增区域」后连续点击 ≥3 点，双击或右键完成；自动分配编号、名称与三级分类 |
 | 编辑保存 | 「保存修改」写入本机 `localStorage`（键 `tongshan.units.v1`）；「导出 GeoJSON」下载后替换 `public/data/units.geojson` |
 | 单元档案卡 | 面积、周长、中心点、外接范围、数据来源、待录字段提示 |
+| 建筑基底提取 | 从 `铜陵古城区地形图_处理.dwg` 的 JMD 居民地图层提取 **2422 个**闭合建筑基底（EPSG:4548 → WGS84），见 §3.1 |
+| 逐栋分割审核 | 顶部「建筑审核」：点击候选点/列表 → 模型按该建筑基底裁剪（外扩 0.8 m）单独显示；只加金色描边、不覆盖原贴图；逐栋 **确认保留 / 剔除 / 取消预览** |
+| 审核撤销与重做 | 确认、剔除、批量、重置均为可撤销操作（`Ctrl+Z` / `Ctrl+Shift+Z`），撤销栈与本机审核状态一起持久化 |
+| 批量与导出 | 按状态/单元/可疑项筛选后批量确认或剔除；导出「已确认」或「全部审核结果」GeoJSON（含 status 字段） |
 | 体量预览 | 单元边界挤出 26 m，用于快速判断建设强度 |
 | 模型透明度 | 5%–100%，`Cesium3DTileStyle` 实时调整 |
 | 高程校准 | 默认 +30 m（见 §5），滑杆 ±100 m 可复查 |
@@ -77,7 +85,10 @@ npm run lint    # ESLint（shadcn/ui 生成组件已单独放宽规则）
 | 3D Tiles 产物 | `platform/public/3dtiles/tongshan/`（tileset.json + Data/，11.16 GB，8958 个文件） |
 | 单元边界（投影） | `单元边界/units_编号_epsg4548.geojson` |
 | 单元边界（WGS84） | `单元边界/units_wgs84.geojson` |
-| 前端使用 | `platform/public/data/units.geojson`（25 个面，含 `unit/name/area_ha/grade`） |
+| 建筑基底（投影） | `单元边界/buildings_epsg4548.geojson`（2422 个面，含 `clip_ring_4548`） |
+| 建筑基底（WGS84） | `单元边界/buildings_wgs84.geojson` |
+| 前端使用（单元） | `platform/public/data/units.geojson`（25 个面，含 `unit/name/area_ha/grade`） |
+| 前端使用（建筑） | `platform/public/data/buildings.geojson`（2422 个面，WGS84，含 `id/code/unit/flags/clip_ring`） |
 | 校验图 | `_work/单元划分校验图.png` |
 
 业务方可直接修改 `src/config.ts`：
@@ -93,8 +104,28 @@ DEFAULT_BASE_LAYER  // 默认卫星影像 satellite
 SATELLITE_URL       // Esri World Imagery 瓦片模板（WGS84/WebMercator）
 SATELLITE_MAX_LEVEL // Esri 最高 18 级，避开 19 级灰色占位瓦片
 GRADE_META          // 分级名称与配色
-SELECT_COLOR        // 选中态朱砂红
+SELECT_COLOR        // 界面强调色朱砂红（不再用于选中填充）
+SELECT_OUTLINE_COLOR // 选中描边金色 #e8b74a
+SELECT_OUTLINE_WIDTH_DEFAULT / MIN / MAX // 描边默认 3 px，可调 1–10 px
+BUILDINGS_URL       // 建筑基底 GeoJSON
+BUILDING_STATUS_META // 审核状态配色（待审/已确认/已剔除）
+BUILDING_CLIP_DEFAULT // 建筑审核默认按基底裁剪
 ```
+
+### 3.1 建筑基底提取（DWG → GeoJSON）
+
+- 源图：`铜陵古城区地形图_处理.dwg`；建筑基底位于 **JMD（居民地）** 图层的闭合多段线。
+- 一键重提取（AutoCAD 2020 Core Console + 本机 Anaconda Python）：
+
+  ```powershell
+  powershell -ExecutionPolicy Bypass -File _work\cad_buildings\run_extract.ps1
+  ```
+
+  流程：DWG → 导出闭合多段线顶点 `verts.csv` → 面积/紧凑度/近重复过滤 → 归属 25 单元 → 写
+  `platform/public/data/buildings.geojson`、`单元边界/buildings_*.geojson`。
+- 过滤规则：JMD 图层、面积 5–5000 m²、紧凑度 ≥0.30、IoU>0.75 去重；结果 2422 栋（1716 栋在单元内，706 栋范围外）。
+- 审核结果按 CAD 句柄（`id`）持久化，重新提取后仍可对上；`code` 为展示序号。
+- 变更 CAD 后先重跑脚本，再在平台「建筑审核」中复核有变化的建筑。
 
 ---
 
@@ -266,17 +297,27 @@ platform/
   public/
     3dtiles/tongshan/       # 11.16 GB 3D Tiles（.gitignore）
     data/units.geojson      # 25 单元边界（WGS84）
+    data/buildings.geojson  # 2422 建筑基底（WGS84）
   src/
-    cesium/PlatformController.ts  # 场景、瓦片、裁剪、拾取、测量、书签
+    cesium/PlatformController.ts  # 场景、瓦片、裁剪、拾取、测量、书签、建筑审核
     components/
-      TopBar.tsx            # 模式/底图/体量/回城
+      TopBar.tsx            # 模式/底图/体量/回城/建筑审核
       UnitPanel.tsx         # 单元列表 + 档案卡
+      BuildingReviewPanel.tsx # 建筑逐栋审核列表 + 筛选 + 撤销/导出
+      BuildingReviewHud.tsx # 屏幕下方确认/剔除快捷条
       Overlays.tsx          # 状态栏/图例/显示设置/测量条/缺失指引
       Bookmarks.tsx         # 视角书签
+    hooks/useBuildingReview.ts # 审核状态 + 撤销/重做 + localStorage
     lib/units.ts            # GeoJSON 加载、周长、点在多边形内
+    lib/buildings.ts        # 建筑基底加载、状态统计、导出
     config.ts               # 业务常量
   deploy/nginx.conf.example
   vite.config.ts
+
+_work/cad_buildings/        # DWG → 建筑基底提取流水线
+  run_extract.ps1
+  export_closed_polylines.lsp
+  extract_buildings.py
 ```
 
 ## 10. 实施纪律（沿用交接方案）

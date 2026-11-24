@@ -1,6 +1,9 @@
 import * as Cesium from "cesium"
 import "cesium/Build/Cesium/Widgets/widgets.css"
 import {
+  BUILDING_CLIP_DEFAULT,
+  BUILDING_STATUS_META,
+  BUILDINGS_URL,
   CAMERA_MIN_PITCH_DEG,
   GLOBE_HIDE_BELOW_HEIGHT,
   GRADE_COLOR,
@@ -12,14 +15,21 @@ import {
   SATELLITE_MAX_LEVEL,
   SATELLITE_URL,
   SELECT_COLOR,
+  SELECT_OUTLINE_COLOR,
+  SELECT_OUTLINE_WIDTH_DEFAULT,
+  SELECT_OUTLINE_WIDTH_MAX,
+  SELECT_OUTLINE_WIDTH_MIN,
   TILESET_CACHE_BYTES,
   TILESET_MAX_CACHE_OVERFLOW_BYTES,
   TILESET_MAX_SSE,
   TILESET_PATH,
+  TILESET_SKIP_LOD,
   UNITS_URL,
   Z_OFFSET_DEFAULT,
   type BaseLayerKind,
+  type BuildingStatus,
 } from "@/config"
+import { loadBuildings, type BuildingFeature } from "@/lib/buildings"
 import {
   clearStoredUnits,
   computeUnitMetrics,
@@ -34,6 +44,18 @@ import {
 
 export type TilesetStatus = "loading" | "ready" | "missing" | "error"
 export type MeasureMode = "none" | "distance" | "area"
+
+export type TilesetLoadPhase = "connecting" | "loading" | "done" | "error"
+
+/** 模型加载进度：connecting 阶段（等待 tileset.json）没有百分比，由前端显示为不确定进度 */
+export interface TilesetLoadProgress {
+  phase: TilesetLoadPhase
+  percent: number
+  loaded: number
+  pending: number
+  processing: number
+  elapsedMs: number
+}
 
 export interface MeasureState {
   mode: MeasureMode
@@ -62,13 +84,36 @@ export interface ControllerCallbacks {
   onUnitsLoaded: (units: UnitFeature[]) => void
   onTilesetStatus: (status: TilesetStatus) => void
   onTileProgress: (pending: number, processing: number) => void
+  onTilesetProgress: (progress: TilesetLoadProgress) => void
   onSelectChange: (unit: number | null) => void
   onMeasureChange: (state: MeasureState) => void
   onUnitsChanged: (units: UnitFeature[]) => void
   onEditState: (state: EditState) => void
+  onBuildingsLoaded: (buildings: BuildingFeature[]) => void
+  onBuildingsError: (message: string) => void
+  onBuildingSelect: (id: string | null) => void
 }
 
 const EARTH_RADIUS = 6371008.8
+
+const STATUS_COLORS: Record<BuildingStatus, Cesium.Color> = {
+  pending: Cesium.Color.fromCssColorString(BUILDING_STATUS_META.pending.color),
+  confirmed: Cesium.Color.fromCssColorString(BUILDING_STATUS_META.confirmed.color),
+  rejected: Cesium.Color.fromCssColorString(BUILDING_STATUS_META.rejected.color),
+}
+const GOLD = Cesium.Color.fromCssColorString(SELECT_OUTLINE_COLOR)
+/** 选中高亮时，未选中分界线用浅色，压暗后仍能从模型上分开 */
+const DIM_OUTLINE_COLOR = "#f4f1e8"
+const DIM_OUTLINE_WIDTH = 1.6
+const DIM_LABEL_FILL = "#fffaf2"
+const DIM_LABEL_INK = "#101418"
+/** 只略压暗，选中范围在 updateWash 里挖空，贴图亮度不变 */
+const WASH_COLOR = "#1a2228"
+const WASH_ALPHA = 0.34
+const OUTLINE_FRAME_BUDGET_MS = 4
+const MOVING_TILESET_SSE = 24
+
+type OutlineSamples = Generator<void, Cesium.Cartesian3[] | null>
 
 export class PlatformController {
   private viewer: Cesium.Viewer
@@ -97,6 +142,25 @@ export class PlatformController {
   private zOffset = Z_OFFSET_DEFAULT
   private opacity = 1
   private baseKind: BaseLayerKind = "satellite"
+  private buildings: BuildingFeature[] = []
+  private buildingPoints: Cesium.PointPrimitiveCollection | null = null
+  private buildingPointById = new Map<string, Cesium.PointPrimitive>()
+  private buildingMode = false
+  private buildingClip = BUILDING_CLIP_DEFAULT
+  private selectedBuilding: string | null = null
+  private buildingStatuses = new Map<string, BuildingStatus>()
+  private buildingOutline: Cesium.Entity | null = null
+  private buildingLabel: Cesium.Entity | null = null
+  private buildingHeights = new Map<string, number>()
+  private heightSyncTimer = 0
+  private viewRefineTimer = 0
+  private viewRefineAttempts = 0
+  private selectedViewHeight = 0
+  private outlineWidth = SELECT_OUTLINE_WIDTH_DEFAULT
+  private selectedUnitOutline: Cesium.Entity | null = null
+  private selectedOutlineFrame = 0
+  private selectedOutlineUnit: number | null = null
+  private cameraMoving = false
   private osmLayer: Cesium.ImageryLayer | null = null
   private satelliteLayer: Cesium.ImageryLayer | null = null
   private destroyed = false
@@ -108,6 +172,16 @@ export class PlatformController {
   private measureFinished = false
   private measureEntities: Cesium.Entity[] = []
   private lastProgressEmit = 0
+  private loadStartAt = 0
+  private tilesLoaded = 0
+  private lastPending = 0
+  private lastProcessing = 0
+  private loadPhase: TilesetLoadPhase = "connecting"
+  private loadProgressEmit = 0
+  private outlineRefreshTimer = 0
+  private dimOutlineCache = new Map<number, Cesium.Cartesian3[]>()
+  private dimOutlineRetry = new Map<number, number>()
+  private dimPump = 0
   private flightEndsAt = 0
   private clamping = false
   private nearGlobeHidden = false
@@ -130,6 +204,10 @@ export class PlatformController {
       contextOptions: { webgl: { stencil: true } },
     })
     this.viewer.scene.globe.baseColor = Cesium.Color.fromCssColorString("#0e2a30")
+    // 固定为当地时间正午，避免按当前时间把天空/受光材质渲染成夜景
+    this.viewer.clock.currentTime = Cesium.JulianDate.fromIso8601("2026-11-21T04:00:00Z")
+    this.viewer.clock.shouldAnimate = false
+    this.viewer.scene.globe.enableLighting = false
     this.viewer.scene.screenSpaceCameraController.enableCollisionDetection = false
     // 卫星底图贴在椭球面上，必须让球面不参与深度遮挡，
     // 否则模型地表略低于椭球面时会被底图盖住（看起来像“卫星图在模型上面”）。
@@ -165,6 +243,8 @@ export class PlatformController {
     }, Cesium.ScreenSpaceEventType.LEFT_DOUBLE_CLICK)
     this.viewer.scene.preRender.addEventListener(this.clampCameraPitch)
     this.viewer.scene.preRender.addEventListener(this.updateGlobeVisibility)
+    this.viewer.camera.moveStart.addEventListener(this.onCameraMoveStart)
+    this.viewer.camera.moveEnd.addEventListener(this.onCameraMoveEnd)
     window.addEventListener("keydown", this.onKeyDown)
   }
 
@@ -172,6 +252,10 @@ export class PlatformController {
     if (e.key !== "Escape") return
     if (this.drawing) {
       this.cancelDrawing()
+      return
+    }
+    if (this.buildingMode) {
+      if (this.selectedBuilding) this.selectBuilding(null)
       return
     }
     if (this.editMode) {
@@ -183,6 +267,16 @@ export class PlatformController {
 
   private onLeftClick(screen: Cesium.Cartesian2) {
     if (performance.now() < this.suppressClickUntil) return
+    if (this.buildingMode) {
+      const pickedId = this.viewer.scene.pick(screen)?.id
+      if (typeof pickedId === "string" && this.buildingPointById.has(pickedId)) {
+        this.toggleBuilding(pickedId)
+        return
+      }
+      const hit = this.pickBuildingAt(screen)
+      this.selectBuilding(hit ? hit.id : null)
+      return
+    }
     if (this.drawing) {
       this.addDrawPoint(screen)
       return
@@ -216,6 +310,11 @@ export class PlatformController {
     }
     if (this.measureMode !== "none" && !this.measureFinished) {
       canvas.style.cursor = "crosshair"
+      return
+    }
+    if (this.buildingMode) {
+      const picked = this.viewer.scene.pick(screen)
+      canvas.style.cursor = typeof picked?.id === "string" ? "pointer" : "crosshair"
       return
     }
     const picked = this.viewer.scene.pick(screen)
@@ -259,7 +358,22 @@ export class PlatformController {
     if (this.destroyed) return
     this.cb.onUnitsLoaded(this.snapshotUnits())
     this.addUnitEntities()
+    void this.loadBuildingData()
     await this.tryLoadTileset()
+  }
+
+  private async loadBuildingData() {
+    try {
+      const buildings = await loadBuildings(BUILDINGS_URL)
+      if (this.destroyed) return
+      this.buildings = buildings
+      this.createBuildingPoints()
+      if (this.tileset) this.scheduleHeightSync(300)
+      this.cb.onBuildingsLoaded(buildings)
+    } catch (err) {
+      console.error("建筑基底数据加载失败", err)
+      if (!this.destroyed) this.cb.onBuildingsError(err instanceof Error ? err.message : "建筑基底数据加载失败")
+    }
   }
 
   private addUnitEntities() {
@@ -307,9 +421,385 @@ export class PlatformController {
     this.labels.set(u.unit, label)
   }
 
+  /* ---------------- 建筑分割审核 ---------------- */
+
+  private createBuildingPoints() {
+    if (this.buildingPoints) {
+      this.viewer.scene.primitives.remove(this.buildingPoints)
+      this.buildingPoints = null
+    }
+    this.buildingPointById.clear()
+    if (!this.buildings.length) return
+    const collection = new Cesium.PointPrimitiveCollection()
+    for (const b of this.buildings) {
+      const status = this.buildingStatuses.get(b.id) ?? "pending"
+      const point = collection.add({
+        id: b.id,
+        position: Cesium.Cartesian3.fromDegrees(b.centroid[0], b.centroid[1], (this.buildingHeights.get(b.id) ?? 0) + 2),
+        color: STATUS_COLORS[status],
+        pixelSize: 8,
+        outlineColor: Cesium.Color.fromCssColorString("#0c1411").withAlpha(0.7),
+        outlineWidth: 1.5,
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+        scaleByDistance: new Cesium.NearFarScalar(80, 1.25, 9000, 0.55),
+      })
+      this.buildingPointById.set(b.id, point)
+    }
+    collection.show = this.buildingMode
+    this.buildingPoints = this.viewer.scene.primitives.add(collection)
+    this.applyBuildingPointStyles()
+  }
+
+  /** 取建筑处的模型表面高度。tileset.getHeight 为毫秒级；未加载处返回 null 待重试 */
+  private sampleBuildingHeight(b: BuildingFeature): number | null {
+    return this.modelHeightAt(b.centroid[0], b.centroid[1])
+  }
+
+  private buildingHeight(b: BuildingFeature): number {
+    const cached = this.buildingHeights.get(b.id)
+    if (cached !== undefined) return cached
+    const h = this.sampleBuildingHeight(b)
+    if (h !== null) {
+      this.buildingHeights.set(b.id, h)
+      return h
+    }
+    return 0
+  }
+
+  private scheduleHeightSync(delay = 900) {
+    window.clearTimeout(this.heightSyncTimer)
+    if (this.buildingMode) this.heightSyncTimer = window.setTimeout(() => this.syncHeightBatch(), delay)
+  }
+
+  /** 分批把候选点贴到模型表面，避免一次性阻塞渲染 */
+  private syncHeightBatch() {
+    if (this.destroyed || !this.buildings.length) return
+    let i = 0
+    const step = () => {
+      if (this.destroyed || !this.buildingMode) return
+      if (!this.cameraMoving) {
+        const deadline = performance.now() + OUTLINE_FRAME_BUDGET_MS
+        for (; i < this.buildings.length && performance.now() < deadline; i++) {
+          const b = this.buildings[i]
+          const point = this.buildingPointById.get(b.id)
+          if (!point) continue
+          const h = this.buildingHeight(b)
+          point.position = Cesium.Cartesian3.fromDegrees(b.centroid[0], b.centroid[1], h + 2)
+        }
+      }
+      if (i < this.buildings.length) this.heightSyncTimer = window.setTimeout(step, 16)
+    }
+    step()
+  }
+
+  private applyBuildingPointStyles() {
+    for (const b of this.buildings) {
+      const point = this.buildingPointById.get(b.id)
+      if (!point) continue
+      const status = this.buildingStatuses.get(b.id) ?? "pending"
+      const isSelected = b.id === this.selectedBuilding
+      const dimmed = this.selectedBuilding !== null && !isSelected
+      point.color = isSelected ? GOLD : dimmed ? STATUS_COLORS[status].withAlpha(0.4) : STATUS_COLORS[status]
+      point.pixelSize = isSelected ? 13 : dimmed ? 5 : status === "rejected" ? 6 : 8
+      point.outlineColor = isSelected
+        ? Cesium.Color.WHITE
+        : Cesium.Color.fromCssColorString("#0c1411").withAlpha(0.7)
+      point.outlineWidth = isSelected ? 3 : 1.5
+    }
+  }
+
+  /** 建筑审核模式：显示候选中点点位并接管点击拾取 */
+  setBuildingMode(on: boolean) {
+    if (this.buildingMode === on) return
+    this.buildingMode = on
+    if (!on) {
+      window.clearTimeout(this.heightSyncTimer)
+      this.selectedBuilding = null
+      window.clearTimeout(this.viewRefineTimer)
+      this.removeBuildingHighlight()
+      this.cb.onBuildingSelect(null)
+    }
+    if (this.buildingPoints) this.buildingPoints.show = on
+    if (on && this.tileset) this.scheduleHeightSync(200)
+    this.applyClip()
+    this.applyUnitStyles()
+    this.updateWash()
+  }
+
+  setBuildingStatuses(statuses: Record<string, BuildingStatus>) {
+    this.buildingStatuses = new Map(Object.entries(statuses))
+    this.applyBuildingPointStyles()
+  }
+
+  setBuildingClip(on: boolean) {
+    this.buildingClip = on
+    this.applyClip()
+  }
+
+  getSelectedBuilding(): string | null {
+    return this.selectedBuilding
+  }
+
+  getBuildings(): BuildingFeature[] {
+    return this.buildings
+  }
+
+  toggleBuilding(id: string) {
+    this.selectBuilding(this.selectedBuilding === id ? null : id)
+  }
+
+  selectBuilding(id: string | null) {
+    const next = id !== null ? this.buildings.find((b) => b.id === id) : null
+    const normalized = next ? next.id : null
+    if (this.selectedBuilding === normalized) return
+    this.selectedBuilding = normalized
+    window.clearTimeout(this.viewRefineTimer)
+    this.removeBuildingHighlight()
+    if (next) {
+      const height = this.buildingHeight(next)
+      this.selectedViewHeight = height
+      const point = this.buildingPointById.get(next.id)
+      if (point) point.position = Cesium.Cartesian3.fromDegrees(next.centroid[0], next.centroid[1], height + 2)
+      this.flyToBuilding(next, height)
+      this.renderBuildingHighlight(next, height)
+      this.scheduleViewRefine(next)
+    }
+    this.applyBuildingPointStyles()
+    this.applyClip()
+    this.cb.onBuildingSelect(normalized)
+  }
+
+  private pickBuildingAt(screen: Cesium.Cartesian2): BuildingFeature | null {
+    const scene = this.viewer.scene
+    let cartesian: Cesium.Cartesian3 | undefined
+    try {
+      cartesian = scene.pickPosition(screen)
+    } catch {
+      cartesian = undefined
+    }
+    if (!Cesium.defined(cartesian)) {
+      cartesian = this.viewer.camera.pickEllipsoid(screen, Cesium.Ellipsoid.WGS84)
+    }
+    if (!Cesium.defined(cartesian)) return null
+    const carto = Cesium.Cartographic.fromCartesian(cartesian)
+    const lon = Cesium.Math.toDegrees(carto.longitude)
+    const lat = Cesium.Math.toDegrees(carto.latitude)
+    for (const b of this.buildings) {
+      const { bbox } = b
+      if (lon < bbox.west || lon > bbox.east || lat < bbox.south || lat > bbox.north) continue
+      if (pointInRing(lon, lat, b.ring)) return b
+    }
+    return null
+  }
+
+  private flyToBuilding(b: BuildingFeature, height: number, duration = 1.3) {
+    // 以模型实际表面高度取景，避免相机目标悬空导致建筑贴到画面边缘
+    const positions = b.ring.map(([lon, lat]) => Cesium.Cartesian3.fromDegrees(lon, lat, height + 0.5))
+    const sphere = Cesium.BoundingSphere.fromPoints(positions)
+    const range = Math.max(48, Math.min(240, sphere.radius * 3.4))
+    this.beginFlight(duration)
+    this.viewer.camera.flyToBoundingSphere(sphere, {
+      duration,
+      offset: new Cesium.HeadingPitchRange(0, Cesium.Math.toRadians(-52), range),
+    })
+  }
+
+  /** 首帧可能因瓦片未就绪取不到真实高度：相机到位后重采样并微调取景 */
+  private scheduleViewRefine(b: BuildingFeature) {
+    this.viewRefineAttempts = 0
+    const tryRefine = () => {
+      if (this.destroyed || this.selectedBuilding !== b.id) return
+      this.viewRefineAttempts++
+      const h = this.sampleBuildingHeight(b)
+      if (h !== null) {
+        this.buildingHeights.set(b.id, h)
+        const point = this.buildingPointById.get(b.id)
+        if (point) point.position = Cesium.Cartesian3.fromDegrees(b.centroid[0], b.centroid[1], h + 2)
+        this.renderBuildingHighlight(b, h)
+        if (Math.abs(h - this.selectedViewHeight) > 1.2) {
+          this.selectedViewHeight = h
+          this.flyToBuilding(b, h, 0.9)
+        }
+        return
+      }
+      if (this.viewRefineAttempts < 5) this.viewRefineTimer = window.setTimeout(tryRefine, 1200)
+    }
+    this.viewRefineTimer = window.setTimeout(tryRefine, 1500)
+  }
+
+  private removeBuildingHighlight() {
+    for (const e of [this.buildingOutline, this.buildingLabel]) {
+      if (e) this.viewer.entities.remove(e)
+    }
+    this.buildingOutline = null
+    this.buildingLabel = null
+  }
+
+  /** 取模型表面的实际高度；瓦片尚未加载到该处时返回 null */
+  private modelHeightAt(lon: number, lat: number): number | null {
+    if (!this.tileset) return null
+    try {
+      const h = this.tileset.getHeight(Cesium.Cartographic.fromDegrees(lon, lat), this.viewer.scene)
+      return h !== undefined && Number.isFinite(h) ? h : null
+    } catch {
+      return null
+    }
+  }
+
+  /** 按米级间距把边界折线加密，避免长直线段从一个点的高度“飞”过屋顶 */
+  private densifyRing(ring: [number, number][], spacingM: number, maxSamples: number): [number, number][] {
+    if (ring.length < 2) return ring.map(([lon, lat]) => [lon, lat] as [number, number])
+    const closed = this.samePoint(ring[0], ring[ring.length - 1])
+    const count = closed ? ring.length - 1 : ring.length
+    const latRad = Cesium.Math.toRadians(ring[0][1])
+    const mPerLon = 111320 * Math.cos(latRad)
+    const mPerLat = 110540
+    const segLen = (a: [number, number], b: [number, number]) =>
+      Math.hypot((b[0] - a[0]) * mPerLon, (b[1] - a[1]) * mPerLat)
+    let perimeter = 0
+    for (let i = 0; i < count; i++) perimeter += segLen(ring[i], ring[(i + 1) % count])
+    const step = Math.max(spacingM, perimeter / maxSamples)
+    const out: [number, number][] = []
+    for (let i = 0; i < count; i++) {
+      const a = ring[i]
+      const b = ring[(i + 1) % count]
+      const parts = Math.max(1, Math.ceil(segLen(a, b) / step))
+      for (let s = 0; s < parts; s++) {
+        const t = s / parts
+        out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t])
+      }
+    }
+    if (out.length) out.push([out[0][0], out[0][1]])
+    return out
+  }
+
+  /**
+   * 把采样高度压到地面：先补洞，再取局部低分位数（抑制屋顶高点），最后中值平滑。
+   * 旧实现按相邻点逐步限幅，一旦边界跨过屋顶，限幅会形成很长的“坡道”，
+   * 描边就悬在空中；局部统计量不会累积误差。
+   */
+  private surfacePercentileHeights(raw: (number | null)[]): number[] | null {
+    const validCount = raw.filter((h): h is number => h !== null).length
+    if (validCount < Math.max(3, Math.ceil(raw.length * 0.25))) return null
+    const values = raw.map((h) => (h === null ? Number.NaN : h))
+    const firstValid = values.findIndex((h) => Number.isFinite(h))
+    if (firstValid < 0) return null
+    let last = firstValid
+    for (let i = firstValid + 1; i < values.length; i++) {
+      if (!Number.isFinite(values[i])) continue
+      if (i - last > 1) {
+        for (let j = last + 1; j < i; j++) {
+          values[j] = values[last] + ((values[i] - values[last]) * (j - last)) / (i - last)
+        }
+      }
+      last = i
+    }
+    for (let i = 0; i < firstValid; i++) values[i] = values[firstValid]
+    for (let i = last + 1; i < values.length; i++) values[i] = values[last]
+    const w = 3
+    const low = values.map((_, i) => {
+      const win = values.slice(Math.max(0, i - w), Math.min(values.length, i + w + 1)).sort((a, b) => a - b)
+      return win[Math.floor((win.length - 1) * 0.2)]
+    })
+    return low.map((_, i) => {
+      const win = low.slice(Math.max(0, i - 1), Math.min(low.length, i + 2)).sort((a, b) => a - b)
+      return win[Math.floor(win.length / 2)]
+    })
+  }
+
+  /** 沿边界贴模型表面生成折线坐标；瓦片未就绪时返回 null，等加载完成再补绘 */
+  private *sampleBoundaryPositions(
+    ring: [number, number][],
+    spacingM: number,
+    maxSamples: number,
+    lift: number,
+  ): OutlineSamples {
+    if (!this.tileset) return null
+    const dense = this.densifyRing(ring, spacingM, maxSamples)
+    if (dense.length < 3) return null
+    const raw: (number | null)[] = []
+    for (const [lon, lat] of dense) {
+      raw.push(this.modelHeightAt(lon, lat))
+      yield
+    }
+    const heights = this.surfacePercentileHeights(raw)
+    if (!heights) return null
+    const positions = dense.map(([lon, lat], i) => Cesium.Cartesian3.fromDegrees(lon, lat, heights[i] + lift))
+    // 首尾是同一个点，但两端的分位窗口不同，必须强制合并，否则接缝处会出现一条竖线
+    if (positions.length > 2 && this.samePoint(dense[0], dense[dense.length - 1])) {
+      positions[positions.length - 1] = positions[0]
+    }
+    return positions
+  }
+
+  private samplesForFrame(samples: OutlineSamples) {
+    const deadline = performance.now() + OUTLINE_FRAME_BUDGET_MS
+    let result = samples.next()
+    while (!result.done && performance.now() < deadline) result = samples.next()
+    return result
+  }
+
+  /** 瓦片调度完成后重贴描边（相机移动会换 LOD，表面高度会变） */
+  private scheduleOutlineRefresh(delay = 350) {
+    window.clearTimeout(this.outlineRefreshTimer)
+    this.outlineRefreshTimer = window.setTimeout(() => {
+      if (this.destroyed) return
+      if (this.selected !== null) {
+        this.renderSelectedUnitOutline(this.units.find((x) => x.unit === this.selected) ?? null)
+      }
+      if (this.selectedBuilding) {
+        const b = this.buildings.find((x) => x.id === this.selectedBuilding)
+        if (b) this.renderBuildingHighlight(b, this.buildingHeight(b))
+      }
+    }, delay)
+  }
+
+  /** 选中建筑：只画金色描边，不叠加填充，保留模型原始贴图 */
+  private renderBuildingHighlight(b: BuildingFeature, height: number) {
+    this.removeBuildingHighlight()
+    const ring = b.clipRing.length >= 4 ? b.clipRing : b.ring
+    const samples = this.sampleBoundaryPositions(ring, 1.2, 180, 0.4)
+    let result = samples.next()
+    while (!result.done) result = samples.next()
+    const positions = result.value
+    if (positions) {
+      this.buildingOutline = this.viewer.entities.add({
+        id: "building-outline",
+        polyline: {
+          positions,
+          width: new Cesium.ConstantProperty(this.outlineWidth),
+          material: GOLD,
+          depthFailMaterial: new Cesium.ColorMaterialProperty(GOLD.withAlpha(0.8)),
+          clampToGround: false,
+        },
+      })
+    }
+    this.buildingLabel = this.viewer.entities.add({
+      id: "building-label",
+      position: Cesium.Cartesian3.fromDegrees(b.centroid[0], b.centroid[1], height + 8),
+      label: {
+        text: `${b.code} · ${b.areaM2.toFixed(0)} m²`,
+        font: "600 12px 'Microsoft YaHei', sans-serif",
+        fillColor: Cesium.Color.fromCssColorString("#1a1408"),
+        showBackground: true,
+        backgroundColor: GOLD.withAlpha(0.94),
+        backgroundPadding: new Cesium.Cartesian2(7, 4),
+        pixelOffset: new Cesium.Cartesian2(0, -14),
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+    })
+  }
+
   private async tryLoadTileset() {
-    const override = new URLSearchParams(window.location.search).get("tileset")
+    const params = new URLSearchParams(window.location.search)
+    const override = params.get("tileset")
     const url = override ?? TILESET_PATH
+    this.loadStartAt = performance.now()
+    this.tilesLoaded = 0
+    this.lastPending = 0
+    this.lastProcessing = 0
+    this.loadPhase = "connecting"
+    this.emitTilesetProgress()
     this.cb.onTilesetStatus("loading")
     try {
       const tileset = await Cesium.Cesium3DTileset.fromUrl(url, {
@@ -317,30 +807,116 @@ export class PlatformController {
         maximumScreenSpaceError: TILESET_MAX_SSE,
         cacheBytes: TILESET_CACHE_BYTES,
         maximumCacheOverflowBytes: TILESET_MAX_CACHE_OVERFLOW_BYTES,
+        // 父层先出来，再跳过中间层，直接补近景需要的细瓦片
+        skipLevelOfDetail: TILESET_SKIP_LOD,
+        baseScreenSpaceError: 1024,
+        skipScreenSpaceErrorFactor: 16,
+        skipLevels: 1,
+        immediatelyLoadDesiredLevelOfDetail: false,
+        loadSiblings: false,
+        cullWithChildrenBounds: true,
+        dynamicScreenSpaceError: true,
+        dynamicScreenSpaceErrorFactor: 4,
+        foveatedScreenSpaceError: true,
+        foveatedConeSize: 0.3,
+        progressiveResolutionHeightFraction: 0.5,
+        cullRequestsWhileMoving: true,
       })
       if (this.destroyed) {
         tileset.destroy()
         return
       }
       this.tileset = tileset
+      if (this.cameraMoving) tileset.maximumScreenSpaceError = MOVING_TILESET_SSE
+      // 倾斜摄影贴图本身已带光照，再乘环境光会发白
+      tileset.imageBasedLighting.imageBasedLightingFactor = new Cesium.Cartesian2(0, 0)
+      this.loadPhase = "loading"
       this.viewer.scene.primitives.add(tileset)
-      tileset.loadProgress.addEventListener(this.handleLoadProgress, this)
+      tileset.loadProgress.addEventListener(this.handleLoadProgress)
+      tileset.tileLoad.addEventListener(this.handleTileLoad)
+      tileset.initialTilesLoaded.addEventListener(this.handleInitialTilesLoaded)
+      tileset.allTilesLoaded.addEventListener(this.handleAllTilesLoaded)
+      this.emitTilesetProgress()
       this.applyZOffset()
       this.applyOpacity()
       this.applyClip()
       this.cb.onTilesetStatus("ready")
       this.flyCity(1.8)
+      this.scheduleHeightSync(1500)
+      if (this.selected !== null) {
+        this.renderSelectedUnitOutline(this.units.find((x) => x.unit === this.selected) ?? null)
+      }
+      if (this.selectedBuilding) {
+        const b = this.buildings.find((x) => x.id === this.selectedBuilding)
+        if (b) this.renderBuildingHighlight(b, this.buildingHeight(b))
+      }
     } catch (err) {
       console.error("三维模型加载失败", err)
+      this.loadPhase = "error"
+        this.emitTilesetProgress()
       if (!this.destroyed) this.cb.onTilesetStatus("missing")
     }
   }
 
-  private handleLoadProgress(pending: number, processing: number) {
+  private loadingPercent(): number {
+    if (this.loadPhase === "done") return 100
+    if (!this.tileset) return 0
+    // 无法预知瓦片总数，用已接收瓦片数估算；initialTilesLoaded 时才到 100%
+    const eased = 1 - Math.exp(-this.tilesLoaded / 24)
+    return Math.min(95, Math.round(10 + 85 * eased))
+  }
+
+  private emitTilesetProgress() {
+    if (this.destroyed) return
+    const percent = this.loadPhase === "done" ? 100 : this.loadingPercent()
+    this.cb.onTilesetProgress({
+      phase: this.loadPhase,
+      percent,
+      loaded: this.tilesLoaded,
+      pending: this.lastPending,
+      processing: this.lastProcessing,
+      elapsedMs: this.loadStartAt ? performance.now() - this.loadStartAt : 0,
+    })
+  }
+
+  private handleLoadProgress = (pending: number, processing: number) => {
+    this.lastPending = pending
+    this.lastProcessing = processing
     const now = performance.now()
-    if (now - this.lastProgressEmit < 200 && pending + processing > 0) return
-    this.lastProgressEmit = now
-    this.cb.onTileProgress(pending, processing)
+    if (now - this.lastProgressEmit >= 200 || (pending === 0 && processing === 0)) {
+      this.lastProgressEmit = now
+      this.cb.onTileProgress(pending, processing)
+    }
+    if (now - this.loadProgressEmit >= 250) {
+      this.loadProgressEmit = now
+      this.emitTilesetProgress()
+    }
+  }
+
+  private handleTileLoad = () => {
+    this.tilesLoaded++
+    const now = performance.now()
+    if (now - this.loadProgressEmit >= 200) {
+      this.loadProgressEmit = now
+      this.emitTilesetProgress()
+    }
+  }
+
+  private handleInitialTilesLoaded = () => {
+    this.finishTilesetLoading()
+    this.scheduleOutlineRefresh(150)
+  }
+
+  private handleAllTilesLoaded = () => {
+    if (this.loadPhase !== "done" && this.tilesLoaded > 0) this.finishTilesetLoading()
+    // 相机移动会切换 LOD，表面高度变化后重贴描边
+    this.scheduleOutlineRefresh(350)
+  }
+
+  private finishTilesetLoading() {
+    if (this.loadPhase === "done") return
+    this.loadPhase = "done"
+    this.emitTilesetProgress()
   }
 
   /** 重试加载瓦片（转换完成后调用） */
@@ -353,58 +929,225 @@ export class PlatformController {
     return u.ring.map(([lon, lat]) => Cesium.Cartesian3.fromDegrees(lon, lat, height))
   }
 
-  /** 选中单元的裁剪范围：ClippingPolygon 默认裁剪内部，inverse 后只保留内部 */
+  /** 裁剪范围：建筑审核优先按建筑基底裁剪，其次按选中单元；inverse 后只保留内部 */
   private applyClip() {
     if (!this.tileset) return
-    if (!this.clipEnabled || this.selected === null) {
+    const preview =
+      this.buildingMode && this.buildingClip && this.selectedBuilding !== null
+        ? this.buildings.find((b) => b.id === this.selectedBuilding)
+        : null
+    const unit = !preview && this.clipEnabled && this.selected !== null
+      ? this.units.find((x) => x.unit === this.selected)
+      : null
+    const ring = preview ? preview.clipRing : unit ? unit.ring : null
+    if (!ring) {
       if (this.clipColl) this.clipColl.enabled = false
       return
     }
-    const u = this.units.find((x) => x.unit === this.selected)
-    if (!u) return
     if (!this.clipColl) {
       this.clipColl = new Cesium.ClippingPolygonCollection({ inverse: true })
       this.tileset.clippingPolygons = this.clipColl
     }
     this.clipColl.removeAll()
-    this.clipColl.add(new Cesium.ClippingPolygon({ positions: this.ringPositions(u) }))
+    this.clipColl.add(
+      new Cesium.ClippingPolygon({
+        positions: ring.map(([lon, lat]) => Cesium.Cartesian3.fromDegrees(lon, lat)),
+      }),
+    )
     this.clipColl.enabled = true
   }
 
-  /** 选中态配色：选中单元高亮，其余单元在“仅高亮”模式下转为灰色，保留边界与填充 */
-  private applyUnitStyles() {
-    const muted = this.selected !== null && !this.clipEnabled
-    for (const u of this.units) {
-      const isSel = u.unit === this.selected
-      const o = this.outlines.get(u.unit)
-      const f = this.fills.get(u.unit)
-      const l = this.labels.get(u.unit)
-      const color = isSel ? SELECT_COLOR : muted ? "#8f959b" : GRADE_COLOR[u.grade]
-      const css = Cesium.Color.fromCssColorString(color)
-      if (o) {
-        o.polyline!.material = new Cesium.ColorMaterialProperty(css.withAlpha(isSel ? 1 : muted ? 0.75 : 0.95))
-        o.polyline!.width = new Cesium.ConstantProperty(isSel ? 3.2 : muted ? 1.3 : 1.6)
+  /** 有选中单元、且没有裁剪/建筑审核时，压暗其余单元 */
+  private isHighlightMode() {
+    return this.selected !== null && !this.clipEnabled && !this.buildingMode
+  }
+
+  /**
+   * 未选中分界线贴模型表面。
+   * 模型比椭球低约 20 米，贴地分类会把线画到屋顶上方，所以改用表面采样高度。
+   */
+  private *sampleDimmedOutline(u: UnitFeature): OutlineSamples {
+    let hit = 0
+    const n = u.ring.length
+    for (let i = 0; i < Math.min(6, n); i++) {
+      const [lon, lat] = u.ring[Math.floor((i * n) / 6)]
+      if (this.modelHeightAt(lon, lat) !== null) hit++
+      yield
+    }
+    if (hit < 2) return null
+    return yield* this.sampleBoundaryPositions(u.ring, 6, 80, 0.2)
+  }
+
+  private unitOutlineSpec(u: UnitFeature) {
+    const dimmed = this.isHighlightMode() && u.unit !== this.selected
+    if (dimmed) {
+      const draped = this.dimOutlineCache.get(u.unit)
+      if (draped) {
+        return {
+          positions: draped,
+          clamp: false,
+          classification: Cesium.ClassificationType.BOTH,
+          arc: Cesium.ArcType.NONE,
+          show: true,
+        }
       }
-      if (f) {
-        const alpha = this.extruded ? (isSel ? 0.5 : muted ? 0.2 : 0.5) : isSel ? 0.34 : muted ? 0.12 : 0.26
-        f.polygon!.extrudedHeight = this.extruded ? new Cesium.ConstantProperty(26) : undefined
-        f.polygon!.material = new Cesium.ColorMaterialProperty(css.withAlpha(alpha))
+      // 表面高度分帧采样，采样完成前先不画，避免贴地线悬在模型上方
+      return {
+        positions: this.ringPositions(u, 0),
+        clamp: false,
+        classification: Cesium.ClassificationType.BOTH,
+        arc: Cesium.ArcType.NONE,
+        show: false,
       }
-      if (l) {
-        l.label!.fillColor = new Cesium.ConstantProperty(
-          Cesium.Color.fromCssColorString(isSel ? "#ffffff" : muted ? "#c9ced3" : "#f0ead8"),
-        )
-      }
+    }
+    return {
+      positions: this.ringPositions(u, 0),
+      clamp: true,
+      classification: Cesium.ClassificationType.BOTH,
+      arc: Cesium.ArcType.GEODESIC,
+      show: true,
     }
   }
 
-  /** “仅高亮”模式下用灰色遮罩压暗选中单元以外的场景（含模型与底图） */
+  /** 分帧采样未选中单元，相机移动时保留已画好的线并暂停采样 */
+  private ensureDimOutlinePump() {
+    if (this.dimPump || !this.isHighlightMode()) return
+    let job: { unit: UnitFeature; ring: UnitFeature["ring"]; samples: OutlineSamples } | null = null
+    const step = () => {
+      this.dimPump = 0
+      if (this.destroyed || !this.isHighlightMode()) return
+      if (this.cameraMoving || this.selectedOutlineFrame) {
+        this.dimPump = window.requestAnimationFrame(step)
+        return
+      }
+      if (job && (job.unit.unit === this.selected || job.unit.ring !== job.ring || !this.units.includes(job.unit))) {
+        job = null
+      }
+      const now = performance.now()
+      const next = job?.unit ?? this.units.find(
+        (u) => u.unit !== this.selected && !this.dimOutlineCache.has(u.unit) && (this.dimOutlineRetry.get(u.unit) ?? 0) <= now,
+      )
+      if (!next) {
+        const waiting = this.units.some((u) => u.unit !== this.selected && !this.dimOutlineCache.has(u.unit))
+        if (waiting) this.dimPump = window.requestAnimationFrame(step)
+        return
+      }
+      job ??= { unit: next, ring: next.ring, samples: this.sampleDimmedOutline(next) }
+      const result = this.samplesForFrame(job.samples)
+      if (!result.done) {
+        this.dimPump = window.requestAnimationFrame(step)
+        return
+      }
+      job = null
+      const draped = result.value
+      if (draped) {
+        this.dimOutlineCache.set(next.unit, draped)
+        this.dimOutlineRetry.delete(next.unit)
+        const o = this.outlines.get(next.unit)
+        if (o?.polyline) {
+          o.show = true
+          o.polyline.positions = new Cesium.ConstantProperty(draped)
+          o.polyline.clampToGround = new Cesium.ConstantProperty(false)
+          o.polyline.arcType = new Cesium.ConstantProperty(Cesium.ArcType.NONE)
+        }
+      } else {
+        this.dimOutlineRetry.set(next.unit, now + 2000)
+      }
+      this.dimPump = window.requestAnimationFrame(step)
+    }
+    this.dimPump = window.requestAnimationFrame(step)
+  }
+
+  /** 选中态配色：选中单元用金色描边、不加填充（保留原始贴图）；其余单元压暗，但编号和分界线保持可读 */
+  private applyUnitStyles() {
+    const highlight = this.isHighlightMode()
+    const muted = highlight || this.buildingMode
+    for (const u of this.units) {
+      const isSel = u.unit === this.selected
+      const dimmed = highlight && !isSel
+      const o = this.outlines.get(u.unit)
+      const f = this.fills.get(u.unit)
+      const l = this.labels.get(u.unit)
+      const outlineCss = isSel ? SELECT_OUTLINE_COLOR : dimmed ? DIM_OUTLINE_COLOR : muted ? "#8f959b" : GRADE_COLOR[u.grade]
+      const fillCss = isSel ? SELECT_OUTLINE_COLOR : dimmed ? "#141a1e" : muted ? "#8f959b" : GRADE_COLOR[u.grade]
+      const outlineColor = Cesium.Color.fromCssColorString(outlineCss)
+      const fillColor = Cesium.Color.fromCssColorString(fillCss)
+      if (o?.polyline) {
+        const spec = this.unitOutlineSpec(u)
+        o.show = spec.show
+        o.polyline.positions = new Cesium.ConstantProperty(spec.positions)
+        o.polyline.clampToGround = new Cesium.ConstantProperty(spec.clamp)
+        o.polyline.classificationType = new Cesium.ConstantProperty(spec.classification)
+        o.polyline.arcType = new Cesium.ConstantProperty(spec.arc)
+        o.polyline.material = new Cesium.ColorMaterialProperty(
+          outlineColor.withAlpha(isSel ? 1 : this.buildingMode ? 0.4 : dimmed ? 1 : 0.95),
+        )
+        o.polyline.width = new Cesium.ConstantProperty(
+          isSel ? this.outlineWidth : dimmed ? DIM_OUTLINE_WIDTH : muted ? 1.3 : 1.6,
+        )
+        o.polyline.depthFailMaterial = new Cesium.ColorMaterialProperty(
+          outlineColor.withAlpha(isSel ? 0.85 : 0),
+        )
+      }
+      if (f) {
+        // 选中单元隐藏填充；只有「体量预览」时才显示金色体量
+        f.show = !isSel || this.extruded
+        const alpha = this.buildingMode
+          ? 0.05
+          : this.extruded
+            ? isSel
+              ? 0.22
+              : muted
+                ? 0.2
+                : 0.5
+            : dimmed
+              ? 0.1
+              : muted
+                ? 0.12
+                : 0.26
+        f.polygon!.extrudedHeight = this.extruded ? new Cesium.ConstantProperty(26) : undefined
+        f.polygon!.material = new Cesium.ColorMaterialProperty(fillColor.withAlpha(alpha))
+      }
+      if (l?.label) {
+        l.show = !this.buildingMode
+        l.label.fillColor = new Cesium.ConstantProperty(
+          Cesium.Color.fromCssColorString(isSel ? "#ffffff" : dimmed ? DIM_LABEL_FILL : "#f0ead8"),
+        )
+        l.label.outlineColor = new Cesium.ConstantProperty(Cesium.Color.fromCssColorString(DIM_LABEL_INK))
+        l.label.outlineWidth = new Cesium.ConstantProperty(dimmed ? 4 : 0)
+        l.label.style = new Cesium.ConstantProperty(
+          dimmed ? Cesium.LabelStyle.FILL_AND_OUTLINE : Cesium.LabelStyle.FILL,
+        )
+        l.label.showBackground = new Cesium.ConstantProperty(dimmed)
+        l.label.backgroundColor = new Cesium.ConstantProperty(
+          Cesium.Color.fromCssColorString(DIM_LABEL_INK).withAlpha(dimmed ? 0.84 : 0),
+        )
+        l.label.backgroundPadding = new Cesium.ConstantProperty(new Cesium.Cartesian2(7, 4))
+        l.label.font = new Cesium.ConstantProperty(
+          dimmed ? "700 16px 'Microsoft YaHei', sans-serif" : "700 13px 'Microsoft YaHei', sans-serif",
+        )
+        l.label.scaleByDistance = new Cesium.ConstantProperty(
+          dimmed
+            ? new Cesium.NearFarScalar(180, 1.25, 8000, 1.05)
+            : new Cesium.NearFarScalar(200, 1.15, 8000, 0.85),
+        )
+        l.label.disableDepthTestDistance = new Cesium.ConstantProperty(Number.POSITIVE_INFINITY)
+      }
+    }
+    if (highlight) this.ensureDimOutlinePump()
+    else if (this.dimPump) {
+      window.cancelAnimationFrame(this.dimPump)
+      this.dimPump = 0
+    }
+  }
+
+  /** 选中高亮时用深色分类面压暗选中单元以外的模型；选中范围留空，原贴图亮度不变 */
   private updateWash() {
     if (this.wash) {
       this.viewer.entities.remove(this.wash)
       this.wash = null
     }
-    if (this.editMode || this.selected === null || this.clipEnabled) return
+    if (this.editMode || this.buildingMode || this.selected === null || this.clipEnabled) return
     const u = this.units.find((x) => x.unit === this.selected)
     if (!u) return
     const d = 0.15
@@ -418,7 +1161,7 @@ export class PlatformController {
       id: "highlight-wash",
       polygon: {
         hierarchy: new Cesium.PolygonHierarchy(outer, [new Cesium.PolygonHierarchy(this.ringPositions(u))]),
-        material: Cesium.Color.fromCssColorString("#6f757b").withAlpha(0.68),
+        material: Cesium.Color.fromCssColorString(WASH_COLOR).withAlpha(WASH_ALPHA),
         outline: false,
         classificationType: Cesium.ClassificationType.BOTH,
       },
@@ -481,6 +1224,8 @@ export class PlatformController {
   }
 
   private refreshUnitGeometry(u: UnitFeature) {
+    this.dimOutlineCache.delete(u.unit)
+    this.dimOutlineRetry.delete(u.unit)
     const positions = this.ringPositions(u)
     const f = this.fills.get(u.unit)
     if (f?.polygon) {
@@ -488,7 +1233,12 @@ export class PlatformController {
     }
     const o = this.outlines.get(u.unit)
     if (o?.polyline) {
-      o.polyline.positions = new Cesium.ConstantProperty(positions)
+      const spec = this.unitOutlineSpec(u)
+      o.show = spec.show
+      o.polyline.positions = new Cesium.ConstantProperty(spec.positions)
+      o.polyline.clampToGround = new Cesium.ConstantProperty(spec.clamp)
+      o.polyline.classificationType = new Cesium.ConstantProperty(spec.classification)
+      o.polyline.arcType = new Cesium.ConstantProperty(spec.arc)
     }
     const l = this.labels.get(u.unit)
     if (l) l.position = new Cesium.ConstantPositionProperty(Cesium.Cartesian3.fromDegrees(u.centroid[0], u.centroid[1]))
@@ -602,6 +1352,9 @@ export class PlatformController {
       this.refreshUnitGeometry(u)
     }
     if (this.clipEnabled) this.applyClip()
+    if (this.selected !== null && units.includes(this.selected)) {
+      this.renderSelectedUnitOutline(this.units.find((u) => u.unit === this.selected) ?? null)
+    }
     this.rebuildVertices()
     this.applyUnitStyles()
     this.updateWash()
@@ -866,6 +1619,7 @@ export class PlatformController {
     this.removeAllUnitEntities()
     this.units = loadStoredUnits() ?? (await loadUnits(UNITS_URL))
     this.selected = null
+    this.renderSelectedUnitOutline(null)
     this.drawing = false
     this.clearDrawEntities()
     this.addUnitEntities()
@@ -892,6 +1646,7 @@ export class PlatformController {
       map.delete(unit)
     }
     this.selected = null
+    this.renderSelectedUnitOutline(null)
     this.applyClip()
     this.applyUnitStyles()
     this.updateWash()
@@ -905,6 +1660,10 @@ export class PlatformController {
   }
 
   private removeAllUnitEntities() {
+    this.dimOutlineCache.clear()
+    this.dimOutlineRetry.clear()
+    window.cancelAnimationFrame(this.dimPump)
+    this.dimPump = 0
     for (const e of [...this.fills.values(), ...this.outlines.values(), ...this.labels.values()]) {
       this.viewer.entities.remove(e)
     }
@@ -924,23 +1683,80 @@ export class PlatformController {
     })
   }
 
+  /** 选中单元的金色表面描边（沿模型表面，避免地面线被建筑挡住） */
+  private renderSelectedUnitOutline(u: UnitFeature | null) {
+    window.cancelAnimationFrame(this.selectedOutlineFrame)
+    this.selectedOutlineFrame = 0
+    const unit = u?.unit ?? null
+    if (this.selectedOutlineUnit !== unit) {
+      if (this.selectedUnitOutline) this.viewer.entities.remove(this.selectedUnitOutline)
+      this.selectedUnitOutline = null
+      this.selectedOutlineUnit = unit
+    }
+    if (!u || !this.tileset) return
+    const samples = this.sampleBoundaryPositions(u.ring, 4, 280, 0.35)
+    const step = () => {
+      if (this.destroyed) return
+      if (!this.cameraMoving) {
+        const result = this.samplesForFrame(samples)
+        if (result.done) {
+          this.selectedOutlineFrame = 0
+          if (result.value) this.setSelectedOutlinePositions(result.value)
+          return
+        }
+      }
+      this.selectedOutlineFrame = window.requestAnimationFrame(step)
+    }
+    this.selectedOutlineFrame = window.requestAnimationFrame(step)
+  }
+
+  private setSelectedOutlinePositions(positions: Cesium.Cartesian3[]) {
+    if (this.selectedUnitOutline?.polyline) {
+      this.selectedUnitOutline.polyline.positions = new Cesium.ConstantProperty(positions)
+      return
+    }
+    this.selectedUnitOutline = this.viewer.entities.add({
+      id: "unit-selected-outline",
+      polyline: {
+        positions,
+        width: new Cesium.ConstantProperty(this.outlineWidth),
+        material: GOLD,
+        depthFailMaterial: new Cesium.ColorMaterialProperty(GOLD.withAlpha(0.85)),
+        clampToGround: false,
+      },
+    })
+  }
+
+  setOutlineWidth(width: number) {
+    this.outlineWidth = Math.min(SELECT_OUTLINE_WIDTH_MAX, Math.max(SELECT_OUTLINE_WIDTH_MIN, width))
+    this.applyUnitStyles()
+    if (this.buildingOutline?.polyline) {
+      this.buildingOutline.polyline.width = new Cesium.ConstantProperty(this.outlineWidth)
+    }
+    if (this.selectedUnitOutline?.polyline) {
+      this.selectedUnitOutline.polyline.width = new Cesium.ConstantProperty(this.outlineWidth)
+    }
+  }
+
   selectUnit(unit: number | null) {
     // 再次点击同一单元视为取消
     if (unit !== null && unit === this.selected) unit = null
     if (this.selected === unit) return
     this.selected = unit
-    if (unit !== null) {
-      const u = this.units.find((x) => x.unit === unit)
-      if (!u) {
-        this.selected = null
-        return
-      }
+    const u = unit !== null ? this.units.find((x) => x.unit === unit) ?? null : null
+    if (unit !== null && !u) {
+      this.selected = null
+      this.renderSelectedUnitOutline(null)
+      return
+    }
+    if (u) {
       this.flyToUnit(u)
       // 等相机到位、瓦片渲染稳定后按真实模型表面重贴顶点
       window.setTimeout(() => {
         if (!this.destroyed && this.editMode && this.selected === u.unit) this.rebuildVertices()
       }, 1800)
     }
+    this.renderSelectedUnitOutline(u)
     this.applyClip()
     this.applyUnitStyles()
     this.updateWash()
@@ -963,8 +1779,27 @@ export class PlatformController {
 
   setZOffset(z: number) {
     this.zOffset = z
+    this.renderSelectedUnitOutline(null)
+    this.dimOutlineCache.clear()
+    this.dimOutlineRetry.clear()
+    if (this.dimPump) {
+      window.cancelAnimationFrame(this.dimPump)
+      this.dimPump = 0
+    }
     this.applyZOffset()
     this.rebuildVertices()
+    this.buildingHeights.clear()
+    const u = this.selected !== null ? this.units.find((x) => x.unit === this.selected) ?? null : null
+    this.renderSelectedUnitOutline(u)
+    if (this.selectedBuilding) {
+      const b = this.buildings.find((x) => x.id === this.selectedBuilding)
+      if (b) {
+        this.selectedViewHeight = this.buildingHeight(b)
+        this.renderBuildingHighlight(b, this.selectedViewHeight)
+      }
+    }
+    if (this.buildings.length) this.scheduleHeightSync(500)
+    this.applyUnitStyles()
   }
 
   private applyZOffset() {
@@ -1228,6 +2063,16 @@ export class PlatformController {
     this.flightEndsAt = performance.now() + duration * 1000 + 250
   }
 
+  private onCameraMoveStart = () => {
+    this.cameraMoving = true
+    if (this.tileset) this.tileset.maximumScreenSpaceError = MOVING_TILESET_SSE
+  }
+
+  private onCameraMoveEnd = () => {
+    this.cameraMoving = false
+    if (this.tileset) this.tileset.maximumScreenSpaceError = TILESET_MAX_SSE
+  }
+
   /** 用户操作结束后把俯角限制在最低值，避免接近水平视角造成远景纹理拉伸 */
   private clampCameraPitch = () => {
     if (this.destroyed || this.clamping || performance.now() < this.flightEndsAt) return
@@ -1258,10 +2103,21 @@ export class PlatformController {
 
   destroy() {
     this.destroyed = true
+    window.clearTimeout(this.heightSyncTimer)
+    window.clearTimeout(this.viewRefineTimer)
+    window.clearTimeout(this.outlineRefreshTimer)
+    window.cancelAnimationFrame(this.dimPump)
+    window.cancelAnimationFrame(this.selectedOutlineFrame)
+    this.viewer.camera.moveStart.removeEventListener(this.onCameraMoveStart)
+    this.viewer.camera.moveEnd.removeEventListener(this.onCameraMoveEnd)
     window.removeEventListener("keydown", this.onKeyDown)
     this.viewer.scene.preRender.removeEventListener(this.clampCameraPitch)
     this.viewer.scene.preRender.removeEventListener(this.updateGlobeVisibility)
     this.handler.destroy()
+    if (this.buildingPoints) {
+      this.viewer.scene.primitives.remove(this.buildingPoints)
+      this.buildingPoints = null
+    }
     this.viewer.destroy()
   }
 }
